@@ -1,0 +1,378 @@
+from concurrent import futures
+import json
+from pathlib import Path
+import re
+import shutil
+from typing import Literal
+import requests
+import roboflow
+import cv2
+from abc import ABC, abstractmethod
+from importlib.util import find_spec
+
+
+
+
+class BaseStorageSystem(ABC):
+    def __init__(self, current_dir: str | Path | None = None) -> None:
+        """
+        Parent Storage System that defines the default functions.
+
+        :param current_dir: Current directory on which the operations
+        / functions of this class operates on.
+        """
+        self._cv2_is_installed = find_spec("cv2") is not None
+        self._current_dir = self._root if current_dir is None else Path(current_dir)
+        if not self._current_dir.is_absolute():
+            self._current_dir = self._root / self._current_dir
+        self._current_dir = self._current_dir.absolute()
+
+
+class HierarchicalStorageSystem(BaseStorageSystem):
+    def __init__(self, current_dir: str | Path | None = None):
+        # self._root = Path("C:/" if os.name == "nt" else "/")
+        self._root = Path.cwd()
+        super().__init__(current_dir=current_dir)
+    
+    def list(
+        self,
+        path: str | Path | None = None,
+        include_files: bool = True,
+        include_dirs: bool = True,
+        file_match_regex: str | re.Pattern | None = None,
+        file_match_case_insensitive: bool = False,
+        dir_match_regex: str | re.Pattern | None = None,
+        dir_match_case_insensitive: bool = False,
+        return_full_path: bool = False,
+    ) -> dict[str, list[str]]:
+        """
+        List directories and files in a specified path with optional
+        filtering.
+
+        This method retrieves directories and files from the given path,
+        allowing for optional inclusion of files and directories. It
+        also supports filtering based on a regular expression pattern,
+        with an option for case-insensitive matching.
+
+        :param path: The directory path to list contents from. If None,
+        the current path is used.
+        :param include_files: Flag to include files in the listing.
+        Defaults to True.
+        :param include_dirs: Flag to include directories in the listing.
+        Defaults to True.
+        :param match_regex: Regular expression pattern to filter names.
+        If None, no filtering is applied.
+        :param match_case_insensitive: Flag for case-insensitive regex
+        matching. Defaults to False.
+
+        :returns: A dictionary containing two keys:
+          - "dirs": A sorted list of directory names.
+          - "files": A sorted list of file names.
+        """
+        abs_path = self.abs_path(path)
+        if isinstance(file_match_regex, str):
+            file_match_regex = re.compile(file_match_regex,
+                                     re.IGNORECASE if file_match_case_insensitive else re.NOFLAG)
+        if isinstance(dir_match_regex, str):
+            dir_match_regex = re.compile(dir_match_regex,
+                                     re.IGNORECASE if dir_match_case_insensitive else re.NOFLAG)
+
+        dirs, files = [], []
+        for dir_item in abs_path.iterdir():
+            if (include_files
+                    and dir_item.is_file()
+                    and (file_match_regex is None
+                         or file_match_regex.match(str(dir_item.name)))):
+                files.append(dir_item.name)
+            elif (include_dirs
+                    and dir_item.is_dir()
+                    and (dir_match_regex is None
+                         or dir_match_regex.match(str(dir_item.name)))):
+                dirs.append(dir_item.name)
+
+        files = sorted(files, key=lambda item: item.lower())
+        dirs = sorted(dirs, key=lambda item: item.lower())
+        if return_full_path:
+            files = [str(abs_path / file) for file in files]
+            dirs = [str(abs_path / dir_) for dir_ in dirs]
+
+        return {"files": files, "dirs": dirs}
+
+
+# For re
+def matched(match_str: str,
+            match_to: str | re.Pattern,
+            match_to_not_marker: str = "!",
+            match_to_regex_marker: str = "re.") -> bool:
+    negate_match = False
+    if isinstance(match_to, str):
+        if match_to.startswith(match_to_not_marker):
+            negate_match = True
+            match_to = match_to[len(match_to_not_marker):]
+        if match_to.startswith(match_to_regex_marker):
+            match_to = re.compile(match_to[len(match_to_regex_marker):])
+
+    _matched = match_to.fullmatch(match_str) if isinstance(match_to, re.Pattern) \
+               else match_str == match_to
+    _matched = not _matched if negate_match else _matched
+    return _matched
+
+def matched_ors_ands(match_str: str,
+                     match_tos: list[str | re.Pattern] | list[list[str | re.Pattern]],
+                     match_to_not_marker: str = "!",
+                     match_to_regex_marker: str = "re.") -> bool:
+    _matched_ors = False
+    for match_to_ands in match_tos:
+        if not isinstance(match_to_ands, list):
+            match_to_ands = [match_to_ands]
+        if matched_ands(match_str=match_str,
+                        match_tos=match_to_ands,
+                        match_to_not_marker=match_to_not_marker,
+                        match_to_regex_marker=match_to_regex_marker):
+            _matched_ors = True
+            break
+    return _matched_ors
+
+
+def _extract_source_name(image: dict):
+    return image["extra"]["name"]
+    return re.sub(r"_[a-zA-Z]{3,4}\.rf\.[a-zA-Z0-9]+", "", image["file_name"])
+
+
+class RoboflowDatasetVersion:
+    def __init__(self,
+                 api_key: str,
+                 workspace: str,
+                 project: str | None = None,
+                 version: int | str | None = None):
+        self._rf = roboflow.Roboflow(api_key=api_key)
+        self.workspace = self._rf.workspace(workspace)
+        self._project_str = None
+        self.project = None
+        self._version_int = None
+        self.version = None
+        if not (project is None and version is None):
+            self.project_version(project=project,
+                                 version=version)
+        self._rf_filenames_urls_map = None
+
+
+    def _threaded_download_orig_image(self,
+                                      image: dict,
+                                      location: str | Path,
+                                      missing_images: dict):
+        """Download the original full-size image for one COCO export file_name."""
+        current_image_path = location / image["file_name"]
+        if current_image_path.exists():
+            current_image_path.unlink()
+
+        source_name = _extract_source_name(image)
+        print(f"--- Downloading original image {source_name}...")
+        if source_name not in self._rf_filenames_urls_map:
+            print(f"Missing file name '{source_name}' in project images {len(self._rf_filenames_urls_map)}.")
+            missing_images[image["file_name"]] = {"source": source_name, "id": image["id"]}
+            image["file_name"] = f"missing_in_project_{source_name}"
+            return None
+
+        download_url = self._rf_filenames_urls_map[source_name]
+        req = requests.get(download_url)
+        req.raise_for_status()
+        image_path = Path(location) / source_name
+        if image_path.exists():
+            image_path.unlink()
+
+        with open(image_path, "wb") as file:
+            file.write(req.content)
+        image["file_name"] = source_name
+
+        return image_path
+
+    def project_version(self,
+                        project: str,
+                        version: int | str):
+        self._project_str = None if project is None else project.lower()
+        self.project = self.workspace.project(self._project_str)
+        self._version_int = None if version is None else int(version)
+        self.version = None if self._version_int is None else self.project.version(self._version_int)
+        self._rf_filenames_urls_map = None
+
+    def download(self,
+                 location: str | Path,
+                 keep_annots: bool = True,
+                 keep_images: bool = True,
+                 download_original_images: bool = True,
+                 filter_splits: list[str | re.Pattern] | None = None,
+                 filter_tags: list[str | re.Pattern] | None = None,
+                 filter_names: list[str | re.Pattern] | None = None,
+                 filter_match_not_symbol: str = "!",
+                 filter_match_regex_marker: str = "re.",
+                 skip_missing: bool = True,
+                 parallel_threads: int = 1):
+        if filter_splits is None:
+            filter_splits = []
+
+        location = Path(location)
+        if location.exists():
+            raise ValueError(f"Download directory '{location}' already exists.")
+
+        info_msg = f"Downloading Roboflow images: Project {self._project_str}, Version {self._version_int}," \
+                   f" Download Location {location}, Keep Annots {keep_annots}, Keep Images {keep_images}," \
+                   f" Original Images {download_original_images}," \
+                   f" Filter Splits {filter_splits}, Filter Tags {filter_tags}, Filter Names {filter_names}," \
+                   f" Parallel Threads (used only if Original Images are being downloaded) {parallel_threads}"
+        print(info_msg)
+        self.version.download(model_format="coco",
+                              location=str(location),
+                              overwrite=False)
+
+        missing_images = {}
+        for split in ["train", "val", "valid", "test"]:
+            split_location = location / split
+            split_in_filter_splits = matched_ors_ands(
+                match_str=split,
+                match_tos=filter_splits or ["train", "val", "valid", "test"],
+                match_to_not_marker=filter_match_not_symbol,
+                match_to_regex_marker=filter_match_regex_marker,
+            )
+            if not split_in_filter_splits:
+                if split_location.is_dir():
+                    shutil.rmtree(split_location)
+                continue
+            
+            coco_annot_path = split_location / "_annotations.coco.json"
+            if not coco_annot_path.is_file():
+                continue
+
+            with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+                coco_dict = json.load(file)
+
+            included_images, included_image_ids = [], []
+            included_annotations = []
+            for image in coco_dict["images"]:
+                source_name = _extract_source_name(image)
+                if filter_tags:
+                    for filter_tags_and in filter_tags:
+                        if isinstance(filter_tags_and, str):
+                            filter_tags_and = [filter_tags_and]
+                        filter_tags_and = list(set(filter_tags_and))
+                        include_image = True
+                        for filter_tag_and in filter_tags_and:
+                            and_tag_matched = False
+                            for image_tag in image["extra"]["user_tags"]:
+                                if matched(match_str=image_tag,
+                                           match_to=filter_tag_and,
+                                           match_to_not_marker=filter_match_not_symbol,
+                                           match_to_regex_marker=filter_match_regex_marker):
+                                    and_tag_matched = True
+                                    filter_tags_and.remove(filter_tag_and)
+                                    break
+                            if not and_tag_matched:
+                                include_image = False
+                                break
+                        if include_image:
+                            break
+                else:
+                    include_image = True
+
+                if include_image:
+                    include_image = not filter_names \
+                            or matched_ors_ands(match_str=source_name,
+                                                match_tos=filter_names,
+                                                match_to_not_marker=filter_match_not_symbol,
+                                                match_to_regex_marker=filter_match_regex_marker)
+                image_file_path = split_location / image["file_name"]
+                if not include_image:
+                    image_file_path.unlink()
+                    continue
+
+                new_file_name = image["file_name"]
+                if keep_images:
+                    if download_original_images:
+                        new_file_name = source_name
+                        image_file_path.unlink()
+                    else:
+                        new_file_name = Path(source_name).stem + image_file_path.suffix
+                        image_file_path.rename(image_file_path.parent / new_file_name)
+                else:
+                    image_file_path.unlink()
+                image["file_name"] = new_file_name
+
+                included_images.append(image)
+                included_image_ids.append(image["id"])
+
+            coco_dict["images"] = included_images
+            coco_dict["annotations"] = [annot for annot in coco_dict["annotations"]
+                                        if annot["image_id"] in included_image_ids]
+            print(f"=== Included images: {len(coco_dict["images"])}")
+
+            if keep_images and download_original_images:
+                if self._rf_filenames_urls_map is None:
+                    self._rf_filenames_urls_map = self.map_filenames_urls(limit=50)
+                with futures.ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+                    fus = []
+                    for image in sorted(coco_dict["images"], key=lambda image: image["extra"]["name"]):
+                        fus.append(executor.submit(self._threaded_download_orig_image,
+                                                   image=image,
+                                                   location=split_location,
+                                                   missing_images=missing_images.setdefault(split, {})))
+                    for future in futures.as_completed(fus):
+                        future.result()
+
+            if keep_annots:
+                if skip_missing and split in missing_images:
+                    missing_image_ids = [missing["id"] for missing in missing_images[split].values()]
+                    coco_dict["images"] = [image for image in coco_dict["images"]
+                                           if image["id"] not in missing_image_ids]
+                    coco_dict["annotations"] = [annot for annot in coco_dict["annotations"]
+                                                if annot["image_id"] not in missing_image_ids]
+
+                with open(coco_annot_path, mode="w", encoding="utf-8") as file:
+                    json.dump(coco_dict, file)
+            else:
+                coco_annot_path.unlink()
+            
+            if not keep_images:
+                fs = HierarchicalStorageSystem(split_location)
+                image_paths = fs.list(include_files=True,
+                                      include_dirs=False,
+                                      file_match_regex=r".*\.(jpg|png|jpeg|jfif|bmp)",
+                                      file_match_case_insensitive=True,
+                                      return_full_path=True)["files"]
+                for image_path in image_paths:
+                    Path(image_path).unlink()
+        
+        missed_images_li = []
+        if missing_images:
+            for split, missed_images in missing_images.items():
+                missed_count = len(missed_images)
+                print(">>>", split, "-- count", missed_count, "-" * 80)
+                for file_name, missed_data in missed_images.items():
+                    missed_images_li.append(missed_data["source"])
+                    print(f"{split} Missing original file {missed_data["source"]} for image {file_name}")
+                print("<<<", split, "-" * 80)
+        print(f"=== Missed images: {len(missed_images_li)} {missed_images_li}")
+
+    def map_filenames_urls(self, limit: int = 100) -> dict:
+        """Map every source image name to its original full-size URL.
+
+        The "url" field points at the stored original (same file the UI's
+        "Download Image" button serves).
+        """
+        print("*** Downloading file names -> urls map ", end="")
+        filenames_urls_map, offset = {}, 0
+        while True:
+            batch = self.project.search(
+                fields=["id", "name", "url"],
+                limit=limit,
+                offset=offset,
+            )
+            if not batch:
+                break
+
+            for image in batch:
+                filenames_urls_map[image["name"]] = image["url"]
+            offset += limit
+            print("█", end="")
+        print()
+
+        return filenames_urls_map
