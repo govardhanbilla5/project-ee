@@ -1,0 +1,1429 @@
+roboflow_utils.py
+from concurrent import futures
+import json
+from pathlib import Path
+import re
+import shutil
+from typing import Literal
+import requests
+import roboflow
+from .storage_systems import HierarchicalStorageSystem
+from ..funcs import matched, matched_ors_ands
+
+
+def _extract_source_name(image: dict):
+    return image["extra"]["name"]
+    return re.sub(r"_[a-zA-Z]{3,4}\.rf\.[a-zA-Z0-9]+", "", image["file_name"])
+
+
+class RoboflowDatasetVersion:
+    def __init__(self,
+                 api_key: str,
+                 workspace: str,
+                 project: str | None = None,
+                 version: int | str | None = None):
+        self._rf = roboflow.Roboflow(api_key=api_key)
+        self.workspace = self._rf.workspace(workspace)
+        self._project_str = None
+        self.project = None
+        self._version_int = None
+        self.version = None
+        if not (project is None and version is None):
+            self.project_version(project=project,
+                                 version=version)
+        self._rf_filenames_urls_map = None
+
+
+    def _threaded_download_orig_image(self,
+                                      image: dict,
+                                      location: str | Path,
+                                      missing_images: dict):
+        """Download the original full-size image for one COCO export file_name."""
+        current_image_path = location / image["file_name"]
+        if current_image_path.exists():
+            current_image_path.unlink()
+
+        source_name = _extract_source_name(image)
+        print(f"--- Downloading original image {source_name}...")
+        if source_name not in self._rf_filenames_urls_map:
+            print(f"Missing file name '{source_name}' in project images {len(self._rf_filenames_urls_map)}.")
+            missing_images[image["file_name"]] = {"source": source_name, "id": image["id"]}
+            image["file_name"] = f"missing_in_project_{source_name}"
+            return None
+
+        download_url = self._rf_filenames_urls_map[source_name]
+        req = requests.get(download_url)
+        req.raise_for_status()
+        image_path = Path(location) / source_name
+        if image_path.exists():
+            image_path.unlink()
+
+        with open(image_path, "wb") as file:
+            file.write(req.content)
+        image["file_name"] = source_name
+
+        return image_path
+
+    def project_version(self,
+                        project: str,
+                        version: int | str):
+        self._project_str = None if project is None else project.lower()
+        self.project = self.workspace.project(self._project_str)
+        self._version_int = None if version is None else int(version)
+        self.version = None if self._version_int is None else self.project.version(self._version_int)
+        self._rf_filenames_urls_map = None
+
+    def download(self,
+                 location: str | Path,
+                 keep_annots: bool = True,
+                 keep_images: bool = True,
+                 download_original_images: bool = True,
+                 filter_splits: list[str | re.Pattern] | None = None,
+                 filter_tags: list[str | re.Pattern] | None = None,
+                 filter_names: list[str | re.Pattern] | None = None,
+                 filter_match_not_symbol: str = "!",
+                 filter_match_regex_marker: str = "re.",
+                 skip_missing: bool = True,
+                 parallel_threads: int = 1):
+        if filter_splits is None:
+            filter_splits = []
+
+        location = Path(location)
+        if location.exists():
+            raise ValueError(f"Download directory '{location}' already exists.")
+
+        info_msg = f"Downloading Roboflow images: Project {self._project_str}, Version {self._version_int}," \
+                   f" Download Location {location}, Keep Annots {keep_annots}, Keep Images {keep_images}," \
+                   f" Original Images {download_original_images}," \
+                   f" Filter Splits {filter_splits}, Filter Tags {filter_tags}, Filter Names {filter_names}," \
+                   f" Parallel Threads (used only if Original Images are being downloaded) {parallel_threads}"
+        print(info_msg)
+        self.version.download(model_format="coco",
+                              location=str(location),
+                              overwrite=False)
+
+        missing_images = {}
+        for split in ["train", "val", "valid", "test"]:
+            split_location = location / split
+            split_in_filter_splits = matched_ors_ands(
+                match_str=split,
+                match_tos=filter_splits or ["train", "val", "valid", "test"],
+                match_to_not_marker=filter_match_not_symbol,
+                match_to_regex_marker=filter_match_regex_marker,
+            )
+            if not split_in_filter_splits:
+                if split_location.is_dir():
+                    shutil.rmtree(split_location)
+                continue
+            
+            coco_annot_path = split_location / "_annotations.coco.json"
+            if not coco_annot_path.is_file():
+                continue
+
+            with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+                coco_dict = json.load(file)
+
+            included_images, included_image_ids = [], []
+            included_annotations = []
+            for image in coco_dict["images"]:
+                source_name = _extract_source_name(image)
+                if filter_tags:
+                    for filter_tags_and in filter_tags:
+                        if isinstance(filter_tags_and, str):
+                            filter_tags_and = [filter_tags_and]
+                        filter_tags_and = list(set(filter_tags_and))
+                        include_image = True
+                        for filter_tag_and in filter_tags_and:
+                            and_tag_matched = False
+                            for image_tag in image["extra"]["user_tags"]:
+                                if matched(match_str=image_tag,
+                                           match_to=filter_tag_and,
+                                           match_to_not_marker=filter_match_not_symbol,
+                                           match_to_regex_marker=filter_match_regex_marker):
+                                    and_tag_matched = True
+                                    filter_tags_and.remove(filter_tag_and)
+                                    break
+                            if not and_tag_matched:
+                                include_image = False
+                                break
+                        if include_image:
+                            break
+                else:
+                    include_image = True
+
+                if include_image:
+                    include_image = not filter_names \
+                            or matched_ors_ands(match_str=source_name,
+                                                match_tos=filter_names,
+                                                match_to_not_marker=filter_match_not_symbol,
+                                                match_to_regex_marker=filter_match_regex_marker)
+                image_file_path = split_location / image["file_name"]
+                if not include_image:
+                    image_file_path.unlink()
+                    continue
+
+                new_file_name = image["file_name"]
+                if keep_images:
+                    if download_original_images:
+                        new_file_name = source_name
+                        image_file_path.unlink()
+                    else:
+                        new_file_name = Path(source_name).stem + image_file_path.suffix
+                        image_file_path.rename(image_file_path.parent / new_file_name)
+                else:
+                    image_file_path.unlink()
+                image["file_name"] = new_file_name
+
+                included_images.append(image)
+                included_image_ids.append(image["id"])
+
+            coco_dict["images"] = included_images
+            coco_dict["annotations"] = [annot for annot in coco_dict["annotations"]
+                                        if annot["image_id"] in included_image_ids]
+            print(f"=== Included images: {len(coco_dict["images"])}")
+
+            if keep_images and download_original_images:
+                if self._rf_filenames_urls_map is None:
+                    self._rf_filenames_urls_map = self.map_filenames_urls(limit=50)
+                with futures.ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+                    fus = []
+                    for image in sorted(coco_dict["images"], key=lambda image: image["extra"]["name"]):
+                        fus.append(executor.submit(self._threaded_download_orig_image,
+                                                   image=image,
+                                                   location=split_location,
+                                                   missing_images=missing_images.setdefault(split, {})))
+                    for future in futures.as_completed(fus):
+                        future.result()
+
+            if keep_annots:
+                if skip_missing and split in missing_images:
+                    missing_image_ids = [missing["id"] for missing in missing_images[split].values()]
+                    coco_dict["images"] = [image for image in coco_dict["images"]
+                                           if image["id"] not in missing_image_ids]
+                    coco_dict["annotations"] = [annot for annot in coco_dict["annotations"]
+                                                if annot["image_id"] not in missing_image_ids]
+
+                with open(coco_annot_path, mode="w", encoding="utf-8") as file:
+                    json.dump(coco_dict, file)
+            else:
+                coco_annot_path.unlink()
+            
+            if not keep_images:
+                fs = HierarchicalStorageSystem(split_location)
+                image_paths = fs.list(include_files=True,
+                                      include_dirs=False,
+                                      file_match_regex=r".*\.(jpg|png|jpeg|jfif|bmp)",
+                                      file_match_case_insensitive=True,
+                                      return_full_path=True)["files"]
+                for image_path in image_paths:
+                    Path(image_path).unlink()
+        
+        missed_images_li = []
+        if missing_images:
+            for split, missed_images in missing_images.items():
+                missed_count = len(missed_images)
+                print(">>>", split, "-- count", missed_count, "-" * 80)
+                for file_name, missed_data in missed_images.items():
+                    missed_images_li.append(missed_data["source"])
+                    print(f"{split} Missing original file {missed_data["source"]} for image {file_name}")
+                print("<<<", split, "-" * 80)
+        print(f"=== Missed images: {len(missed_images_li)} {missed_images_li}")
+
+    def map_filenames_urls(self, limit: int = 100) -> dict:
+        """Map every source image name to its original full-size URL.
+
+        The "url" field points at the stored original (same file the UI's
+        "Download Image" button serves).
+        """
+        print("*** Downloading file names -> urls map ", end="")
+        filenames_urls_map, offset = {}, 0
+        while True:
+            batch = self.project.search(
+                fields=["id", "name", "url"],
+                limit=limit,
+                offset=offset,
+            )
+            if not batch:
+                break
+
+            for image in batch:
+                filenames_urls_map[image["name"]] = image["url"]
+            offset += limit
+            print("█", end="")
+        print()
+
+        return filenames_urls_map
+
+
+main.py:
+from argparse import ArgumentParser
+import base64
+from concurrent import futures
+from copy import deepcopy
+from datetime import datetime
+import json
+from pathlib import Path
+import re
+import shutil
+import sys
+import time
+from typing import Literal
+
+import cv2
+import Levenshtein
+import numpy as np
+import pandas as pd
+import requests
+import roboflow
+
+from fishfin_lib import (
+    HierarchicalStorageSystem,
+    RoboflowDatasetVersion,
+)
+
+from constants import (
+    DOWNLOAD_DIR,
+    DOWNLOAD_RAW_DIR,
+    LOCAL_DATA_ROOT_DIR,
+    NOW_TS,
+    ROBOFLOW_API_KEY,
+    ROBOFLOW_API_SECRET_KEY,
+    ROBOFLOW_WORKSPACE,
+    TIMEOUT,
+    UPLOAD_DIR,
+)
+
+fs = HierarchicalStorageSystem()
+
+
+def _calc_edit_distance(gt_srnum: str, inf_srnum: str) -> int:
+    unknowns_idx = [idx for idx, char in enumerate(gt_srnum) if char == "?"]
+    gt_srnum = "".join([char for idx, char in enumerate(gt_srnum) if idx not in unknowns_idx])
+    inf_srnum = "".join([char for idx, char in enumerate(inf_srnum) if idx not in unknowns_idx])
+    return Levenshtein.distance(gt_srnum, inf_srnum)
+
+
+def _download_dir(reuse_download_dir) -> Path:
+    if reuse_download_dir is None:
+        fs = HierarchicalStorageSystem(current_dir=LOCAL_DATA_ROOT_DIR)
+        download_dirs = fs.list(include_files=False,
+                                include_dirs=True,
+                                dir_match_regex=r"download-[0-9]{8}-[0-9]{6}.*",
+                                dir_match_case_insensitive=True,
+                                return_full_path=True)["dirs"]
+        if download_dirs:
+            download_dir = download_dirs[-1]
+        else:
+            raise ValueError(f"No download directory found in {LOCAL_DATA_ROOT_DIR}.")
+    else:
+        download_dir = reuse_download_dir
+    
+    print(f"* Using download directory: {download_dir}")
+    return Path(download_dir)
+
+
+def _read_config_json(config_json_path: str | Path | None = None) -> dict:
+    """
+    Reads configutation and returns dictinary.
+
+    If no config path was passed, uses config/default.json in current project.
+    If relative path was passed, tries to locate that in current project.
+    If absoute path was passed, tries to read it from there.
+    Raises error if path passed or default path are not found.
+    """
+    if config_json_path is None:
+        config_json_path = "configs/default.json"
+
+    config_json_path = Path(config_json_path)
+    if not config_json_path.suffix == ".json":
+        raise ValueError(f"config-json-path `{config_json_path}` must have `.json` file extension.")
+    if not config_json_path.is_absolute():
+        config_json_path_try = Path.cwd() / config_json_path
+        print(f"Trying config_json_path `{config_json_path_try}`...")
+        if not config_json_path_try.exists():
+            if str(config_json_path.parent) == ".":
+                config_json_path_try = Path.cwd() / "configs" / config_json_path
+                print(f"Trying config_json_path `{config_json_path_try}`...")
+                if not config_json_path_try.exists():
+                    raise ValueError(f"Could not locate config-json-path `{config_json_path}`.")
+        config_json_path = config_json_path_try
+        if not config_json_path.is_file():
+            raise ValueError(f"config-json-path `{config_json_path}` must be a file.")
+        with open(config_json_path, mode="r", encoding="utf-8") as fi:
+            config = json.load(fi)
+        return config
+
+
+def _threaded_test_inference(test_image_idx: int,
+                             test_images: list[dict],
+                             image_dir: str | Path,
+                             workflow_url: str,
+                             api_timeout: int,
+                             source_csv_path: str | Path) -> None:
+    test_image = deepcopy(test_images[test_image_idx])
+    print(f"Processing image {test_image_idx} {test_image["name"]}...")
+    test_image.setdefault("gr_srnum", "")
+    test_image.update({
+        "inf_srnum": "",
+        "avg_confidence": "",
+        "edit_distance": "",
+        "msg": "",
+        "dims": "",
+        "dbg_srnuma_bbox": "",
+        "dbg_srnumb_bbox": "",
+        "dbg_srnuma_classification": "",
+        "dbg_srnumb_classification": "",
+        "dbg_srnuma_chardets": "",
+        "dbg_srnumb_chardets": "",
+        "inference_msg": "",
+    })
+    # image_path = image_dir / test_image["name"]
+    possible_image_paths = fs.list(path=image_dir,
+                                    include_files=True,
+                                    include_dirs=False,
+                                    file_match_regex=rf"{test_image["name"]}\.(jpg|jpeg|png|jfif)",
+                                    file_match_case_insensitive=True,
+                                    return_full_path=True)["files"]
+    if not possible_image_paths:
+        test_image["inference_msg"] = f"No file names start with '{test_image["name"]}', skipped."
+        print(test_image["inference_msg"])
+        return
+    elif len(possible_image_paths) > 1:
+        test_image["inference_msg"] = f"More than one image match name {test_image["name"]}, skipped."
+        print(test_image["inference_msg"])
+        return
+    else:
+        image_path = possible_image_paths[-1]
+
+    image_np = cv2.imread(image_path)
+    test_image["dims"] = "x".join(list(str(dim) for dim in image_np.shape))
+
+    with open(image_path, "rb") as file:
+        img_bytes = file.read()
+    img_b64 = base64.b64encode(img_bytes).decode("ascii")
+
+    api_payload = {
+        "api_key": ROBOFLOW_API_KEY,
+        "inputs": {
+            "image": {"type": "base64", "value": img_b64},
+            "debug": True,
+        },
+    }
+    response = requests.post(
+        workflow_url,
+        json=api_payload,
+        verify=False,
+        timeout=api_timeout,
+    )
+    if response.status_code != 200:
+        test_image["inference_msg"] = f"HTTP error (status code {response.status_code}) in processing image {image_path}, skipped."
+        print(test_image["inference_msg"])
+        return
+    
+    try:
+        result = response.json()
+    except Exception as e:
+        test_image["inference_msg"] = f"Error: API responded with 200 for image {image_path} but body wasn't valid JSON."
+        print(test_image["inference_msg"])
+        return
+
+    gt_srnum = test_image["gt_srnum"].replace("?", "")
+    api_result = result["outputs"][0]["result"]
+    if api_result["status"].lower() == "error":
+        test_image["msg"] = api_result["error_msg"]
+        if gt_srnum:
+            test_image["edit_distance"] = len(gt_srnum) if gt_srnum else ""
+    else:
+        test_image["inf_srnum"] = str(api_result["serial_number"])
+        test_image["avg_confidence"] = api_result["average_confidence_score"]
+        if gt_srnum:
+            test_image["edit_distance"] = _calc_edit_distance(
+                gt_srnum=test_image["gt_srnum"], inf_srnum=test_image["inf_srnum"]
+            )
+        for key in ["dbg_srnuma_bbox", "dbg_srnumb_bbox",
+                    "dbg_srnuma_classification", "dbg_srnumb_classification",
+                    "dbg_srnuma_chardets", "dbg_srnumb_chardets"]:
+            test_image[key] = str(api_result.get("debug_extras", {}).get(key, ""))
+
+    # writing in loop so that results are immediately available for analysis
+    test_images[test_image_idx] = test_image
+    test_images_df = pd.DataFrame(test_images)
+    test_images_df = test_images_df[["sr", "split", "name", "gt_srnum", "inf_srnum", "edit_distance", "avg_confidence", "dims", "tags", "msg",
+                                     "dbg_srnuma_bbox", "dbg_srnumb_bbox",
+                                     "dbg_srnuma_classification", "dbg_srnumb_classification",
+                                     "dbg_srnuma_chardets", "dbg_srnumb_chardets"]]
+    test_images_df.to_csv(source_csv_path, index=False)
+    print(f"Processed image {test_image_idx} {image_path}!")
+
+def _threaded_rf_upload(rf_project: str,
+                        split: str,
+                        idx: int,
+                        image: dict) -> None:
+    print(
+        f"Split {split},"
+        f" {image["srnuma_first2"]}"
+        f" Image {idx} {image["name"]}: Uploading crops..."
+    )
+    for image_crop in image["crops"].values():
+        rf_project.upload(
+            image_path=image_crop["out_file_path"],
+            tag_names=sorted(image_crop["tags"]),
+            batch_name=image["auto_batch_name"],
+            split=split,
+            annotation_path=image_crop["classification_class"],
+            num_retry=3,
+            is_prediction=True,
+        )
+
+
+def boilerplate(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "reuse_download_dir": None,
+        "upload_dir": None,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("boilerplate", {}))
+    download_dir = _download_dir(step_config["reuse_download_dir"])
+
+    upload_dir = Path(step_config["upload_dir"]
+                      or UPLOAD_DIR.format(upload_type="cropped-boilerplate"))
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    for split in ["train", "valid", "test"]:
+        print(f"=== Processing split {split}...")
+        split_dir_path = download_dir / split
+        coco_annot_path = split_dir_path / "_annotations.coco.json"
+        if not split_dir_path.is_dir() or not coco_annot_path.is_file():
+            print(f"Split directory {split_dir_path} not found, skipped.")
+            continue
+        with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+            coco_dict = json.load(file)
+
+        class_map = {category["id"]: category["name"]
+                     for category in coco_dict["categories"]
+                     if not category["supercategory"] == "none"}
+
+        images_in_split = {}
+        for image in coco_dict["images"]:
+            image_in_split = images_in_split.setdefault(image["id"], {})
+            image_in_split["image"] = image
+            image_in_split["annotations"] = {}
+        print(f"===== Found {len(images_in_split.keys())} images in '{split}' split =====")
+
+        for annotation in coco_dict["annotations"]:
+            if annotation["image_id"] not in images_in_split:
+                print(f"Skipped annotation {annotation["id"]} as image id {annotation["image_id"]} is not found.")
+                continue
+            image_annots = images_in_split[annotation["image_id"]]["annotations"]
+            class_name = class_map[annotation["category_id"]]
+            if class_name in image_annots.keys():
+                raise ValueError(
+                    f"Duplicate category_id '{annotation["category_id"]}'"
+                    f" for image_id '{annotation["image_id"]}'"
+                    f" in file '{coco_annot_path}'."
+                )
+            image_annots[class_map[annotation["category_id"]]] = annotation
+        
+        coco_dict["categories"] = [
+            category for category in coco_dict["categories"]
+            if category["name"] != "Boilerplate"
+        ]
+
+        upload_split_dir_path = upload_dir / split
+        new_images, new_annots = [], []
+        if images_in_split:
+            upload_split_dir_path.mkdir(parents=True, exist_ok=True)
+        limit, image_idx = 20, 0
+        for image_id, image_data in images_in_split.items():
+            image_idx += 1
+            if image_idx > limit:
+                break
+            image, image_annots = image_data["image"], image_data["annotations"]
+            print(f"Processing {split} image {image["file_name"]}...")
+            if "Boilerplate" not in image_annots:
+                print(f"Boilerplate annotation not found in image")
+                continue
+            boilerplate_annot = image_annots.pop("Boilerplate")
+            bp_xmin, bp_ymin, bp_width, bp_height = boilerplate_annot["bbox"]
+            bp_xmin, bp_ymin = int(round(bp_xmin, 0)), int(round(bp_ymin, 0))
+            bp_width, bp_height = int(round(bp_width, 0)), int(round(bp_height, 0))
+
+            image_path = split_dir_path / image["file_name"]
+            image_bgr = cv2.imread(image_path)
+            # image_path.unlink()
+            cropped_image_path = upload_split_dir_path / (image_path.stem + "_boilerpate.png")
+            image["file_name"] = image["extra"]["name"] = cropped_image_path.name
+            image["width"], image["height"] = bp_width, bp_height
+            cropped = image_bgr[bp_ymin:bp_ymin+bp_height+1, bp_xmin:bp_xmin+bp_width+1]
+            cv2.imwrite(cropped_image_path, cropped)
+
+            for class_name, annot in image_annots.items():
+                if class_name.lower() not in ["srnuma", "srnumb"]:
+                    continue
+                xmin, ymin, width, height = annot["bbox"]
+                xmin, ymin = int(round(xmin, 0)), int(round(ymin, 0))
+                width, height = int(round(width, 0)), int(round(height, 0))
+                xmin -= bp_xmin
+                ymin -= bp_ymin
+                annot["bbox"] = [xmin, ymin, width, height]
+                new_annots.append(annot)
+            new_images.append(image)
+        coco_dict["images"], coco_dict["annotations"] = new_images, new_annots
+        new_coco_dict_path = upload_split_dir_path / "_annotations.coco.json"
+        with open(new_coco_dict_path, mode="w", encoding="utf-8") as file:
+            json.dump(coco_dict, file, indent=2)
+
+
+def classification(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "project": None,
+        "reuse_download_dir": None,
+        "blur": None,
+        "parallel_threads": 1,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("classification", {}))
+
+    blur = step_config.setdefault("blur", None)
+    if blur is None:
+        blur_type = None
+    else:
+        blur = blur.split(":")
+        blur_type, blur_kernel = blur[0], int(blur[1])
+
+    download_dir = _download_dir(step_config["reuse_download_dir"])
+
+    images, auto_batch_maps = {}, set()
+    srnumas_first2 = set()
+
+    for split in ["train", "valid", "test"]:
+        split_dir_path = download_dir / split
+        coco_annot_path = split_dir_path / "_annotations.coco.json"
+        if not split_dir_path.is_dir() or not coco_annot_path.is_file():
+            print(f"Split directory {split_dir_path} not found, skipped.")
+            continue
+        with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+            coco_dict = json.load(file)
+
+        class_map = {category["id"]: category["name"]
+                     for category in coco_dict["categories"]
+                     if not category["supercategory"] == "none"}
+
+        images_in_split = {}
+        for image in coco_dict["images"]:
+            images_in_split = images.setdefault(split, {})
+            images_in_split[image["id"]] = {
+                "name": image["extra"]["name"],
+                "file_path": split_dir_path / image["file_name"],
+                "width": image["width"],
+                "height": image["height"],
+                "tags": image["extra"]["user_tags"],
+                "auto_batch_name": "",
+                "crops": {},
+                "srnuma_first2": "",
+            }
+        print(f"===== Filtered {len(images_in_split.keys())} images in '{split}' split =====")
+
+        for annotation in coco_dict["annotations"]:
+            image_annots = images_in_split[annotation["image_id"]].setdefault("annotations", {})
+            class_name = class_map[annotation["category_id"]]
+            if class_name in image_annots.keys():
+                raise ValueError(
+                    f"Duplicate category_id '{annotation["category_id"]}'"
+                    f" for image_id '{annotation["image_id"]}'"
+                    f" in file '{coco_annot_path}'."
+                )
+            image_annots[class_name] = annotation["bbox"]
+            image_annots = {class_name: image_annots[class_name]
+                            for class_name in sorted(image_annots.keys())}
+            images_in_split[annotation["image_id"]]["annotations"] = image_annots
+
+    print(f"===== Filtered {sum([len(images_in_split.keys()) for images_in_split in images.values()])} images =====")
+
+    if images:
+        re_timestamp = re.compile(r"^[0-9]{8}-[0-9]{6}$")
+        re_match_first2srnuma = re.compile(r"^[a-zA-Z][0-9]$")
+        upload_dir = Path(UPLOAD_DIR.format(upload_type="classification"))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        for split, images_in_split in images.items():
+            for image in images_in_split.values():
+                if not Path(image["file_path"]).is_file():
+                    print(f"WARNING: File not found to upload: {image["file_path"]}")
+                    continue
+                image_bgr = cv2.imread(image["file_path"])
+                image_name = Path(image["name"])
+                image["tags"] = [tag for tag in image["tags"] if not bool(re_timestamp.match(tag))]
+                image["tags"].append(NOW_TS)
+
+                auto_batch_name = ""
+                if "Bucket" in image["tags"] or "bucket" in image["tags"]:
+                    auto_batch_name += "Bucket_"
+                elif "Nozzle" in image["tags"] or "nozzle" in image["tags"]:
+                    auto_batch_name += "Nozzle_"
+
+                if "Manual" in image["tags"] or "manual" in image["tags"]:
+                    auto_batch_name += "Manual_"
+                elif "Cobot" in image["tags"] or "cobot" in image["tags"]:
+                    auto_batch_name += "Cobot_"
+
+                srnuma_type, srnumb_type = "", ""
+                for tag in image["tags"]:
+                    if not image["srnuma_first2"] and re_match_first2srnuma.match(tag):
+                        srnumas_first2.add(tag)
+                        image["srnuma_first2"] = tag
+                    if not srnuma_type and tag.lower().startswith("srnuma"):
+                        srnuma_type = tag
+                    if not srnumb_type and tag.lower().startswith("srnumb"):
+                        srnumb_type = tag
+                if not (image["srnuma_first2"] and srnuma_type and srnumb_type):
+                    raise ValueError(
+                        f"Split {split}, Image {image["name"]}: Could not generate batch name."
+                    )
+                auto_batch_name += f"{image["srnuma_first2"]}_{srnuma_type}_{srnumb_type}"
+                if blur_type:
+                    auto_batch_name += f"_{blur_type}{blur_kernel}x{blur_kernel}"
+                auto_batch_maps.add(auto_batch_name)
+                image["auto_batch_name"] = auto_batch_name
+
+                for class_name, annotation in image["annotations"].items():
+                    image_crop_dict = image["crops"].setdefault(class_name, {})
+                    image_crop_dict["tags"] = [
+                        tag for tag in image["tags"]
+                        if not (tag.startswith("SrNumA") or tag.startswith("SrNumB"))
+                    ]
+                    image_crop_dict["tags"].append(class_name)
+                    if f"{class_name}BallPeened" in image["tags"]:
+                        image_crop_dict["tags"].append("BallPeened")
+                        image_crop_dict["classification_class"] = "ballpeened"
+                    elif f"{class_name}Embossed" in image["tags"]:
+                        image_crop_dict["tags"].append("Embossed")
+                        image_crop_dict["classification_class"] = "embossed"
+                    else:
+                        raise ValueError(
+                            f"Image {image["name"]} must have tag"
+                            f" {class_name} BallPeened or {class_name} Embossed"
+                        )
+
+                    xmin, ymin, width, height = annotation
+                    xmin, ymin = int(round(xmin, 0)), int(round(ymin, 0))
+                    width, height = int(round(width, 0)), int(round(height, 0))
+
+                    cropped = image_bgr[ymin: ymin + height + 1, xmin: xmin + width + 1]
+                    if blur_type is None:
+                        blurred_name = ""
+                    else:
+                        blurred_name = f"_{blur_type}{blur_kernel}x{blur_kernel}"
+                        image_crop_dict["tags"].append(f"{blur_type}{blur_kernel}x{blur_kernel}")
+                        if blur_type == "GaussianBlur":
+                            cropped = cv2.GaussianBlur(cropped, (blur_kernel, blur_kernel), 0)
+                        elif blur_type == "BoxFilter":
+                            cropped = cv2.boxFilter(cropped,
+                                                    ddepth=-1,
+                                                    ksize=(blur_kernel, blur_kernel),
+                                                    anchor=(-1, -1),
+                                                    normalize=True,
+                                                    borderType=cv2.BORDER_DEFAULT)
+                        else:
+                            raise ValueError(f"Unknown blur type {blur_type}.")
+
+                    out_image_path = upload_dir / split / image_crop_dict["classification_class"] / f"{image_name.stem}{blurred_name}_{class_name}_classification.png"
+                    out_image_path.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(out_image_path, cropped)
+                    image_crop_dict["out_file_path"] = str(out_image_path)
+
+        print(f"Uploading images to project '{step_config["project"]}',"
+              f" batch names {sorted(list(auto_batch_maps))}.")
+        # rf_workspace.upload_dataset(
+        #     dataset_path=str(upload_dir) + "/",
+        #     project_name=target_config["project"],
+        #     num_workers=10,
+        #     project_license="Private",
+        #     project_type="classification",
+        #     batch_name=upload_batch_name,
+        #     num_retries=0,
+        #     is_prediction=True,
+        # )
+
+        rf_dataset_version = RoboflowDatasetVersion(
+            api_key=ROBOFLOW_API_SECRET_KEY,
+            workspace=ROBOFLOW_WORKSPACE,
+            project=step_config["project"],
+        )
+        rf_target_project = rf_dataset_version.project
+        idx = 0
+        for srnuma_first2 in sorted(list(srnumas_first2)):
+            for split, images_in_split in images.items():
+                with futures.ThreadPoolExecutor(max_workers=step_config["parallel_threads"]) as executor:
+                    fus = []
+                    for image in images_in_split.values():
+                        if image["srnuma_first2"] != srnuma_first2:
+                            continue
+                        fus.append(executor.submit(_threaded_rf_upload,
+                                                   rf_project=rf_target_project,
+                                                   split=split,
+                                                   idx=idx,
+                                                   image=image))
+                        idx += 1
+                    for future in futures.as_completed(fus):
+                        future.result()
+    else:
+        print("Nothing to upload.")
+
+
+def crop_boundingbox(config_json_path: str | Path | None = None) -> None:
+    """
+    1. Reads config file, gets most parameters from there.
+    2. Loops through sources in config and only uses the source if skip=False.
+       In most cases, you only need one source.
+    3. Gets project-id and dataset version for each source, and downloads
+       those images in COCO format.
+    4. The download maintains train, val and test categories
+    """
+    step_config = {
+        "project": None,
+        "reuse_download_dir": None,
+        "blur": None,
+        "parallel_threads": 1,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("crop_boundingbox", {}))
+    download_dir = _download_dir(step_config["reuse_download_dir"])
+
+    images, auto_batch_maps = {}, set()
+    srnumas_first2 = set()
+
+    rf_workspace = roboflow.Roboflow(api_key=ROBOFLOW_API_SECRET_KEY) \
+        .workspace(ROBOFLOW_WORKSPACE)
+
+    for split in ["train", "valid", "test"]:
+        split_dir_path = download_dir / split
+        coco_annot_path = split_dir_path / "_annotations.coco.json"
+        if not split_dir_path.is_dir() or not coco_annot_path.is_file():
+            print(f"Split directory {split_dir_path} not found, skipped.")
+            continue
+        with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+            coco_dict = json.load(file)
+
+        class_map = {category["id"]: category["name"]
+                        for category in coco_dict["categories"]
+                        if not category["supercategory"] == "none"}
+
+        images_in_split = {}
+        for image in coco_dict["images"]:
+            images_in_split = images.setdefault(split, {})
+            images_in_split[image["id"]] = {
+                "name": image["extra"]["name"],
+                "file_path": split_dir_path / image["file_name"],
+                "width": image["width"],
+                "height": image["height"],
+                "tags": image["extra"]["user_tags"],
+                "auto_batch_name": "",
+                "crops": {},
+                "srnuma_first2": "",
+            }
+        print(f"===== Filtered {len(images_in_split.keys())} images in '{split}' split =====")
+
+        for annotation in coco_dict["annotations"]:
+            image_annots = images_in_split[annotation["image_id"]].setdefault("annotations", {})
+            class_name = class_map[annotation["category_id"]]
+            if class_name in image_annots:
+                raise ValueError(
+                    f"Duplicate category_id '{annotation["category_id"]}'"
+                    f" for image_id '{annotation["image_id"]}'"
+                    f" in file '{coco_annot_path}'."
+                )
+            image_annots[class_name] = annotation["bbox"]
+            image_annots = {class_name: image_annots[class_name]
+                            for class_name in sorted(image_annots.keys())}
+            images_in_split[annotation["image_id"]]["annotations"] = image_annots
+
+    print(f"===== Filtered {sum([len(images_in_split.keys()) for images_in_split in images.values()])} images =====")
+
+    if images:
+        re_timestamp = re.compile(r"^[0-9]{8}-[0-9]{6}$")
+        re_match_first2srnuma = re.compile(r"^[a-zA-Z][0-9]$")
+        upload_dir = Path(UPLOAD_DIR.format(upload_type="boundingbox"))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.strptime(NOW_TS, "%Y%m%d-%H%M%S")
+        now_fm = datetime.strftime(now, "%Y-%m-%dT%H:%M:%S+05:30")
+        out_coco_common_dict = {
+            "info": {
+                "year": int(datetime.strftime(now, "%Y")),
+                "version": 1,
+                "description": "Created by automation",
+                "contributor": "",
+                "url": "",
+                "date_created": now_fm,
+            },
+            "licenses": [{"id":1,"url":"","name":"Private"}],
+            "categories": [
+                {"id": 0,
+                "name": step_config["supercategory_name"],
+                "supercategory":"none"}
+            ],
+            "annotations": [],
+        }
+        out_coco_batch_dict = {}
+        out_categories = {}
+
+        image_idx = -1
+        for split, images_in_split in images.items():
+            for image in images_in_split.values():
+                if not Path(image["file_path"]).is_file():
+                    print(f"WARNING: File not found to upload: {image["file_path"]}")
+                    continue
+                image_bgr = cv2.imread(image["file_path"])
+                image_name = Path(image["name"])
+                image["tags"] = [tag for tag in image["tags"] if not bool(re_timestamp.match(tag))]
+                image["tags"].append(NOW_TS)
+
+                auto_batch_name = ""
+                if "Bucket" in image["tags"] or "bucket" in image["tags"]:
+                    auto_batch_name += "Bucket_"
+                elif "Nozzle" in image["tags"] or "nozzle" in image["tags"]:
+                    auto_batch_name += "Nozzle_"
+
+                if "Manual" in image["tags"] or "manual" in image["tags"]:
+                    auto_batch_name += "Manual_"
+                elif "Cobot" in image["tags"] or "cobot" in image["tags"]:
+                    auto_batch_name += "Cobot_"
+
+                srnuma_type, srnumb_type = "", ""
+                for tag in image["tags"]:
+                    if not image["srnuma_first2"] and re_match_first2srnuma.match(tag):
+                        srnumas_first2.add(tag)
+                        image["srnuma_first2"] = tag
+                    if not srnuma_type and tag.lower().startswith("srnuma"):
+                        srnuma_type = tag
+                    if not srnumb_type and tag.lower().startswith("srnumb"):
+                        srnumb_type = tag
+                if not (image["srnuma_first2"] and srnuma_type and srnumb_type):
+                    raise ValueError(
+                        f"Split {split}, Image {image["name"]}: Could not generate batch name."
+                    )
+                auto_batch_name += f"{image["srnuma_first2"]}_{srnuma_type}_{srnumb_type}"
+                auto_batch_maps.add(auto_batch_name)
+                image["auto_batch_name"] = auto_batch_name
+
+                for class_name, annotation in image["annotations"].items():
+                    image_idx += 1
+                    if class_name not in out_categories:
+                        class_id = out_coco_common_dict["categories"][-1]["id"] + 1
+                        out_categories[class_name] = class_id
+                        out_coco_common_dict["categories"].append({
+                            "id": class_id,
+                            "name": class_name,
+                            "supercategory": step_config["supercategory_name"]
+                        })
+
+                    image_crop_dict = image["crops"].setdefault(class_name, {})
+                    image_crop_dict["tags"] = [
+                        tag for tag in image["tags"]
+                        if not (tag.startswith("SrNumA") or tag.startswith("SrNumB"))
+                    ]
+                    image_crop_dict["tags"].append(class_name)
+                    if f"{class_name}BallPeened" in image["tags"]:
+                        image_crop_dict["tags"].append("BallPeened")
+                    elif f"{class_name}Embossed" in image["tags"]:
+                        image_crop_dict["tags"].append("Embossed")
+                    else:
+                        raise ValueError(
+                            f"Image {image["name"]} must have tag"
+                            f" {class_name} BallPeened or {class_name} Embossed"
+                        )
+
+                    xmin, ymin, width, height = annotation
+                    xmin, ymin = int(round(xmin, 0)), int(round(ymin, 0))
+                    width, height = int(round(width, 0)), int(round(height, 0))
+
+                    out_image_path = upload_dir / image["auto_batch_name"] / split / f"{image_name.stem}_{class_name}.png"
+                    out_image_path.parent.mkdir(parents=True, exist_ok=True)
+                    cropped = image_bgr[ymin:ymin+height+1, xmin:xmin+width+1]
+                    cv2.imwrite(out_image_path, cropped)
+                    out_image = {
+                        "id": image_idx,
+                        "license": 1,
+                        "file_name": out_image_path.name,
+                        "height": height,
+                        "width": width,
+                        "date_captured": now_fm,
+                        "extra": {
+                            "user_tags": sorted(image_crop_dict["tags"]),
+                            "name": out_image_path.name,
+                        }
+                    }
+                    out_coco_batch_split_images = out_coco_batch_dict \
+                        .setdefault(image["auto_batch_name"], {}) \
+                        .setdefault(split, {}) \
+                        .setdefault("images", [])
+                    out_coco_batch_split_images.append(out_image)
+
+        rf_dataset_version = RoboflowDatasetVersion(
+            api_key=ROBOFLOW_API_SECRET_KEY,
+            workspace=ROBOFLOW_WORKSPACE,
+            project=step_config["project"],
+        )
+        rf_target_project = rf_dataset_version.project
+
+        for batch, batch_split in out_coco_batch_dict.items():
+            for split, split_dict in batch_split.items():
+                coco_dict = out_coco_common_dict | split_dict
+                with open(upload_dir / batch / split / "_annotations.coco.json",
+                          mode="w",
+                          encoding="utf-8") as file:
+                    json.dump(coco_dict, file, indent=2)
+            print(f"Uploading images to project '{step_config["project"]}', job name '{batch}'.")
+            print(str(upload_dir / batch) + "/")
+            rf_workspace.upload_dataset(
+                dataset_path=str(upload_dir / batch) + "/",
+                project_name=step_config["project"],
+                num_workers=10,
+                project_license="Private",
+                project_type="object-detection",
+                batch_name=batch,
+                num_retries=2,
+                is_prediction=True,
+            )
+
+        # https://docs.roboflow.com/developer/python-sdk/upload-a-dataset
+        # print(inspect.signature(
+        #     rf_workspace.upload_dataset
+        # ))
+    else:
+        print("Nothing to upload.")
+
+
+def download(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "project": None,
+        "version": None,
+        "download_dir": DOWNLOAD_DIR,
+        "keep_annots": True,
+        "keep_images": True,
+        "use_original_images": True,
+        "filter_splits": [],
+        "filter_tags": [],
+        "filter_names": [],
+        "filter_match_regex_marker": "re.",
+        "filter_match_not_symbol": "!",
+        "parallel_threads": 2,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("download", {}))
+
+    rf_dataset_version = RoboflowDatasetVersion(
+        api_key=ROBOFLOW_API_SECRET_KEY,
+        workspace=ROBOFLOW_WORKSPACE,
+        project=step_config["project"],
+        version=step_config["version"],
+    )
+
+    rf_dataset_version.download(
+        location=step_config["download_dir"],
+        keep_annots=step_config["keep_annots"],
+        keep_images=step_config["keep_images"],
+        download_original_images=step_config["use_original_images"],
+        filter_splits=step_config["filter_splits"],
+        filter_tags=step_config["filter_tags"],
+        filter_names=step_config["filter_names"],
+        filter_match_not_symbol=step_config["filter_match_not_symbol"],
+        filter_match_regex_marker=step_config["filter_match_regex_marker"],
+        parallel_threads=step_config["parallel_threads"],
+    )
+
+
+def ground_truth_serial_nums(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "reuse_download_dir": None,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("ground_truth_serial_nums", {}))
+    download_dir = _download_dir(step_config["reuse_download_dir"])
+
+    re_roboflow_name = re.compile(r"_[a-zA-Z]{3,4}\.rf\.[a-zA-Z0-9]+")
+    re_parent_name = re.compile(r"_SrNum[AB][_a-zA-Z0-9]*")
+    images_for_csv = []
+    for split_order, split in enumerate(["train", "valid", "test"]):
+        split_dir_path = download_dir / split
+        coco_annot_path = split_dir_path / "_annotations.coco.json"
+        if not split_dir_path.is_dir() or not coco_annot_path.is_file():
+            print(f"Split directory {split_dir_path} not found, skipped.")
+            continue
+        with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+            coco_dict = json.load(file)
+
+        class_map = {
+            category["id"]: "?" if category["name"] == "Unknown" else category["name"]
+            for category in coco_dict["categories"]
+            if not category["supercategory"] == "none"
+        }
+
+        images_in_split = {image["id"]: image for image in coco_dict["images"]}
+        for annot in coco_dict["annotations"]:
+            if annot["image_id"] in images_in_split.keys():
+                image_annots = images_in_split[annot["image_id"]].setdefault("#annotations", [])
+                image_annots.append(annot)
+
+        parent_images_in_split = {}
+        for image_id, image in images_in_split.items():
+            srnum_type = "SrNumA" if "SrNumA" in image["file_name"] \
+                    else "SrNumB" if "SrNumB" in image["file_name"] \
+                    else "Indeterminate"
+            parent_name = image["extra"]["name"]  # re_roboflow_name.sub("", image["file_name"])
+            parent_name = re_parent_name.sub("", parent_name)
+            parent_stem = Path(parent_name).stem
+            parent_image_in_split = parent_images_in_split.setdefault(parent_stem, {})
+
+            parent_tags = parent_image_in_split.setdefault("tags", set())
+            srnum_type_tag = ""
+            for check in ["SrNumA", "SrNumB"]:
+                if check in image["extra"]["user_tags"]:
+                    image["extra"]["user_tags"].remove(check)
+                    srnum_type_tag += check
+                    break
+            for check in ["BallPeened", "Embossed"]:
+                if check in image["extra"]["user_tags"]:
+                    image["extra"]["user_tags"].remove(check)
+                    srnum_type_tag += check
+                    break
+            parent_tags.add(srnum_type_tag)
+            parent_tags.update(image["extra"]["user_tags"])
+
+            characters_with_coords = []
+            for annot in image["#annotations"]:
+                if annot["category_id"] in class_map:
+                    character = class_map[annot["category_id"]]
+                    if character.lower() == "unknown":
+                        character = "?"
+                    characters_with_coords.append({
+                        'char': character,
+                        'x_coord': annot['bbox'][0],
+                    })
+            characters_with_coords.sort(key=lambda item: item['x_coord'])
+            parent_image_in_split[srnum_type] = "".join([item['char'] for item in characters_with_coords])
+            
+        for parent_image_stem, parent_image_dict in parent_images_in_split.items():
+            images_for_csv.append({
+                "split_order": split_order,
+                "split": split,
+                "name": parent_image_stem,
+                "gt_srnum": parent_image_dict.get("SrNumA", "????") + parent_image_dict.get("SrNumB", "??????"),
+                "tags": ", ".join(sorted(list(parent_image_dict["tags"])))
+            })
+
+    images_df = pd.DataFrame(images_for_csv)
+    images_df = images_df.sort_values(by=["split_order", "name"])
+    images_df = images_df.reset_index(drop=True)
+    images_df["sr"] = images_df.index + 1
+    images_df = images_df[["sr", "split", "name", "gt_srnum", "tags"]]
+    csv_path = Path(LOCAL_DATA_ROOT_DIR) / f"gt-srnums-{NOW_TS}.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    images_df.to_csv(csv_path, index=False, encoding='utf-8')
+
+
+def test_serial_nums(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "source_csv_path": None,
+        "image_dir": None,
+        "workflow_url": "https://internal-app-uai3071351-roboflow-dev-int-60802489.us-east-1.elb.amazonaws.com/proxy?url=https://dev-aisocr-cpu.roboflow.cloud/infer/workflows/ge-vernova/aisocrinference",
+        "api_timeout": 300,
+        "parallel_threads": 1,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("test_serial_nums", {}))
+
+    source_csv_path = step_config["source_csv_path"]
+    if source_csv_path is None:
+        csv_paths = fs.list(path=LOCAL_DATA_ROOT_DIR,
+                            include_files=True,
+                            include_dirs=False,
+                            file_match_regex=r"gt-srnums-[0-9]{8}-[0-9]{6}.*\.csv",
+                            file_match_case_insensitive=True,
+                            return_full_path=True)["files"]
+        if csv_paths:
+            source_csv_path = csv_paths[-1]
+        else:
+            raise ValueError(f"No csv found in {LOCAL_DATA_ROOT_DIR}.")
+    test_images_df = pd.read_csv(filepath_or_buffer=source_csv_path)
+    test_images = test_images_df.to_dict(orient="records")
+
+    image_dir = step_config["image_dir"]
+    if image_dir is None:
+        image_dirs = fs.list(path=LOCAL_DATA_ROOT_DIR,
+                             include_files=False,
+                             include_dirs=True,
+                             dir_match_regex=r"download-[0-9]{8}-[0-9]{6}.*",
+                             dir_match_case_insensitive=True,
+                             return_full_path=True)["dirs"]
+        if image_dirs:
+            image_dir = image_dirs[-1]
+        else:
+            raise ValueError(f"No image download directories found in {LOCAL_DATA_ROOT_DIR}.")
+    image_dir = Path(image_dir)
+    if not image_dir.is_dir():
+        raise ValueError(f"Image directory does not exist: {image_dir}.")
+
+    with futures.ThreadPoolExecutor(max_workers=step_config["parallel_threads"]) as executor:
+        fus = []
+        for test_image_idx in range(len(test_images)):
+            fus.append(executor.submit(_threaded_test_inference,
+                                       test_image_idx=test_image_idx,
+                                       test_images=test_images,
+                                       image_dir=image_dir,
+                                       workflow_url=step_config["workflow_url"],
+                                       api_timeout=step_config["api_timeout"],
+                                       source_csv_path=source_csv_path))
+        for future in futures.as_completed(fus):
+            future.result()
+
+    test_images_df = pd.DataFrame(test_images)
+    test_images_df = test_images_df[["sr", "split", "name", "gt_srnum", "inf_srnum",
+                                     "edit_distance", "avg_confidence", "dims", "tags", "msg",
+                                     "dbg_srnuma_bbox", "dbg_srnumb_bbox",
+                                     "dbg_srnuma_classification", "dbg_srnumb_classification",
+                                     "dbg_srnuma_chardets", "dbg_srnumb_chardets"]]
+    test_images_df = test_images_df.sort_values(by=["edit_distance", "name"], ascending=[False, True])
+    test_images_df.to_csv(source_csv_path, index=False)
+
+
+def sandbox() -> None:
+    src_loc = "/home/sagemaker-user/ais-ocr-data/upload-to-997"
+    upload_loc_root = "/home/sagemaker-user/ais-ocr-data/upload-to-997-root"
+    new_project = "SerialNumber-997"
+
+    src_loc = Path(src_loc)
+    upload_loc_root = Path(upload_loc_root)
+    re_match_first2srnuma = re.compile(r"^[a-zA-Z][0-9]$")
+
+    if upload_loc_root.is_dir():
+        shutil.rmtree(upload_loc_root)
+
+    all_batch_names = set()
+    for split in ["train", "valid", "test"]:
+        src_split_dir = src_loc / split
+        with open (src_split_dir / "_annotations.coco.json") as file:
+            coco_dict = json.load(file)
+        for category in coco_dict["categories"]:
+            if category["supercategory"] == "none":
+                category["name"] = new_project
+            else:
+                category["supercategory"] = new_project
+
+        
+        combined_tags = {}
+        for img in coco_dict["images"]:
+            parent_name = Path(img["extra"]["name"]).stem
+            # if parent_name.endswith("_png"):
+            #     parent_name = parent_name.replace("_png", "")
+            tags = img["extra"]["user_tags"].copy()
+            add_tag = ""
+            for srnum_tag in ["SrNumA", "SrNumB"]:
+                if srnum_tag in tags:
+                    parent_name = parent_name.replace(f"_{srnum_tag}", "")
+                    tags.remove(srnum_tag)
+                    add_tag = srnum_tag
+            for srnum_tag in ["BallPeened", "Embossed"]:
+                if srnum_tag in tags:
+                    tags.remove(srnum_tag)
+                    add_tag += srnum_tag
+            img["#parent_name"] = parent_name
+            tags.append(add_tag)
+            combined_tag = combined_tags.setdefault(parent_name, set())
+            combined_tag.update(tags)
+
+        batch_maps = {}
+        for parent_name, tags in combined_tags.items():
+            bname = []
+            if "Bucket" in tags:
+                bname.append("Bucket")
+            if "Manual" in tags:
+                bname.append("Manual")
+            for tag in tags:
+                if re_match_first2srnuma.match(tag):
+                    bname.append(tag)
+                    break
+            if "SrNumAEmbossed" in tags:
+                bname.append("SrNumAEmbossed")
+            if "SrNumABallPeened" in tags:
+                bname.append("SrNumABallPeened")
+            if "SrNumBEmbossed" in tags:
+                bname.append("SrNumBEmbossed")
+            if "SrNumBBallPeened" in tags:
+                bname.append("SrNumBBallPeened")
+            batch_maps[parent_name] = "_".join(bname)
+        
+        batch_cocos = {}
+        for img in coco_dict["images"]:
+            img["#batch_name"] = batch_maps[img["#parent_name"]]
+
+        batch_names = sorted(list(set(list(batch_maps.values()))))
+        all_batch_names.update(batch_names)
+        batch_cocos = {batch_name: deepcopy(coco_dict)
+                       for batch_name in batch_names}
+        for batch_name, batch_coco in batch_cocos.items():
+            batch_path = upload_loc_root / batch_name / split
+            batch_path.mkdir(parents=True, exist_ok=True)
+            new_images, new_image_ids, new_annots = [], [], []
+            for img in batch_coco["images"]:
+                if img["#batch_name"] == batch_name:
+                    orig_file_path = src_split_dir / img["file_name"]
+                    ifn = Path(orig_file_path)
+                    ifn_stem = ifn.stem
+                    if ifn_stem.endswith("_png"):
+                        img["file_name"] = ifn_stem.replace("_png", "") + ifn.suffix
+                    if not orig_file_path.is_file():
+                        orig_file_path = src_split_dir / img["file_name"]      
+                    shutil.copy2(orig_file_path, batch_path / img["file_name"])
+                    new_image_ids.append(img["id"])
+                    for k in list(img.keys()):
+                        if k.startswith("#"):
+                            del img[k]
+                    new_images.append(img)
+            batch_coco["images"] = new_images
+            for ann in batch_coco["annotations"]:
+                if ann["image_id"] in new_image_ids:
+                    new_annots.append(ann)
+            batch_coco["annotations"] = new_annots
+
+            batch_annot_path = batch_path / "_annotations.coco.json"
+            with open(batch_annot_path, mode="w", encoding="utf-8") as file:
+                json.dump(batch_coco, file, indent=2)
+
+    rf_workspace = roboflow.Roboflow(api_key=ROBOFLOW_API_SECRET_KEY) \
+            .workspace(ROBOFLOW_WORKSPACE)
+    all_batch_names = sorted(list(all_batch_names))
+    print(len(all_batch_names))
+    for batch_name in all_batch_names:
+        if batch_name != "Bucket_Manual_K3_SrNumABallPeened_SrNumBBallPeened":
+            continue
+        batch_path = upload_loc_root / batch_name
+        print(batch_path, batch_path.is_dir())
+        rf_workspace.upload_dataset(
+            dataset_path=str(batch_path) + "/",
+            project_name=new_project.lower(),
+            num_workers=10,
+            project_license="Private",
+            project_type="object-detection",
+            batch_name=batch_name,
+            num_retries=2,
+            is_prediction=True,
+        )
+
+
+def upload(config_json_path: str | Path | None = None) -> None:
+    step_config = {
+        "project": None,
+        "reuse_download_dir": None,
+        "supercategory": None,
+        "preannotated": True,
+        "parallel_threads": 10,
+    }
+    step_config.update(_read_config_json(config_json_path).setdefault("upload", {}))
+
+    download_dir = _download_dir(step_config["reuse_download_dir"])
+    for split in ["train", "valid", "test"]:
+        split_dir_path = download_dir / split
+        coco_annot_path = split_dir_path / "_annotations.coco.json"
+        if not split_dir_path.is_dir() or not coco_annot_path.is_file():
+            print(f"Split directory {split_dir_path} not found, skipped.")
+            continue
+        with open(coco_annot_path, mode="r", encoding="utf-8") as file:
+            coco_dict = json.load(file)
+        if step_config["supercategory"] is not None:
+            for idx in range(len(coco_dict["categories"])):
+                category = coco_dict["categories"][idx]
+                if category["supercategory"] == "none":
+                    category["name"] = step_config["supercategory"]
+                else:
+                    category["supercategory"] = step_config["supercategory"]
+            with open(coco_annot_path, mode="w", encoding="utf-8") as file:
+                json.dump(coco_dict, file)
+
+    rf_dataset_version = RoboflowDatasetVersion(
+        api_key=ROBOFLOW_API_SECRET_KEY,
+        workspace=ROBOFLOW_WORKSPACE,
+    )
+    rf_workspace = rf_dataset_version.workspace
+    rf_workspace.upload_dataset(
+        dataset_path=str(Path(download_dir)) + "/",
+        project_name=step_config["project"],
+        num_workers=step_config["parallel_threads"],
+        project_license="Private",
+        project_type="object-detection",
+        batch_name=NOW_TS,
+        num_retries=2,
+        is_prediction=not step_config["preannotated"],
+    )
+
+
+def sandbox1() -> None:
+    download_location = "/home/sagemaker-user/ais-ocr-data/DELETEME-002"
+    rf_dataset_version = RoboflowDatasetVersion(
+        api_key=ROBOFLOW_API_SECRET_KEY,
+        workspace=ROBOFLOW_WORKSPACE
+    )
+    rf_dataset_version.project_version(project="serialnumber-002",
+                                       version=29)
+    if Path(download_location).exists():
+        shutil.rmtree(download_location)
+
+    rf_dataset_version.download(location=download_location,
+                                keep_images=False)
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(
+        prog="ais_ocr_training",
+        description="Prepare for Metem X-Ray training",
+        allow_abbrev=False
+    )
+
+    cmd_args = parser.add_argument_group("command arguments")
+    cmd_args.add_argument("-q", "--run-sequence",  # try to make this config json
+                          nargs='*',
+                          default=[],
+                          help="run a sequence")
+    cmd_args.add_argument("-c", "--config-json-path",
+                          nargs='*',
+                          default=None,
+                          help="config JSON used for all sequence items")
+    args = parser.parse_args()
+
+    if not args.run_sequence:
+        sys.exit("WARNING: No sequence to run")
+
+    for run_item in args.run_sequence:
+        call = boilerplate if run_item in ["bp", "boilerplate"] \
+            else classification if run_item in ["cl", "classification"] \
+            else crop_boundingbox if run_item in ["bb", "crop_boundingbox"] \
+            else download if run_item in ["dl", "download"] \
+            else ground_truth_serial_nums if run_item in ["gtsr", "ground_truth_serial_nums"] \
+            else sandbox if run_item in ["sb", "sandbox"] \
+            else test_serial_nums if run_item in ["ttsr", "test_serial_nums"] \
+            else upload if run_item in ["ul", "upload"] \
+            else None
+        if call is None:
+            raise ValueError(f"Unknown sequence item: {run_item}")
+        call(args.config_json_path)
+
+    # if args.classification:
+    #     classification(config_json_path=args.config_json_path,
+    #                    job_name=args.job_name,
+    #                    comment=args.comment)
+
+    # if args.crop_boundingbox:
+    #     if not args.filter_tags:
+    #         parser.error("-t <filter_tags> are required (1 or more)"
+    #                      " for bounding box processing.")
+    #     crop_boundingbox(config_json_path=args.config_json_path,
+    #                      filter_tags=args.filter_tags,
+    #                      job_name=args.job_name,
+    #                      comment=args.comment)
+
+    # elif args.download:
+    #     download(config_json_path=args.config_json_path)
+
+    # elif args.infer_multi:
+    #     config_json_path=args.config_json_path,
+    #     ground_truth_file_path=args.ground_truth_file_path,
+    #     filter_split=args.split,
+    #     filter_tags=args.filter_tags,
+    #     input_images_dir=args.inference_input_dir,
+    #     job_name=args.job_name,
+    #     comment=args.comment
+    # )
