@@ -3,7 +3,8 @@ Batch forecast service.
 
 Reads (Part Number, Tier 1) pairs from an uploaded Excel, runs the
 forecast engine for each unique combination, and writes a result
-workbook with one sheet per forecast month (12 sheets) plus a Summary.
+workbook with one sheet per forecast month (12 sheets, or 13 when the
+current month is included) plus a Summary.
 
 COLUMN LAYOUT (per monthly sheet)
 ──────────────────────────────────
@@ -61,14 +62,14 @@ def _build_columns() -> list[tuple[str, str, callable]]:
         ("Quarter\n(Current)",   "@",             lambda pn, t1, fr, mf: _ctx(mf).quarter_label),
         ("Quarter\n(Previous)",  "@",             lambda pn, t1, fr, mf: _ctx(mf).prev_quarter_label),
         ("MC_Q\n($/lb)",         "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q),
-        ("MC_Q-1\n($/lb)",       "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q_prev),
+        ("MC_Q-1\n($/lb)",       "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q_1),
         ("PPI_Q",                "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q),
-        ("PPI_Q-1",              "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q_prev),
+        ("PPI_Q-1",              "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q_1),
         ("PPI Factor",           "0.000000%",     lambda pn, t1, fr, mf: _ctx(mf).ppi_factor),
         ("CNG_Q\n($/lb)",        "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q),
-        ("CNG_Q-1\n($/lb)",      "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q_prev),
+        ("CNG_Q-1\n($/lb)",      "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q_1),
         ("AMS_Q\n($/lb)",        "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q),
-        ("AMS_Q-1\n($/lb)",      "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q_prev),
+        ("AMS_Q-1\n($/lb)",      "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q_1),
         ("AMS Delta\n($/lb)",    "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_delta),
         ("DF_c",                 "0.00",          lambda pn, t1, fr, mf: mf.df_c),
         ("Predicted Price\n($)", "$#,##0.0000",   lambda pn, t1, fr, mf: mf.predicted_price),
@@ -164,31 +165,249 @@ def read_parts_from_upload(file_bytes: bytes) -> list[tuple[str, str]]:
     return pairs
 
 
+# CNG column name aliases (case-insensitive, matched against stripped headers).
+_CNG_Q_ALIASES  = ("cng_q", "cng q", "cng_q current", "cng current", "cng - current qtr")
+_CNG_Q1_ALIASES = ("cng_q-1", "cng_q1", "cng q-1", "cng_q_1", "cng previous", "cng - previous qtr")
+
+
+def read_parts_with_cng_from_upload(file_bytes: bytes) -> list[dict]:
+    """
+    Read (Part Number, Tier 1, CNG_Q, CNG_Q-1) rows from the uploaded Excel.
+
+    The CNG values are taken straight from the file — the caller no longer
+    supplies them. Expects columns 'Part Number', 'Tier 1', 'CNG_Q' and
+    'CNG_Q-1' (case-insensitive; a few common spellings are accepted).
+    Returns a deduplicated list of dicts, preserving input order:
+        {"part_number", "tier_1", "cng_q", "cng_q_1"}
+    """
+    df = pd.read_excel(
+        io.BytesIO(file_bytes),
+        engine="openpyxl",
+        dtype=str,
+        keep_default_na=False,
+        na_values=[""],
+    )
+
+    cols_lower = {c.strip().lower(): c for c in df.columns}
+
+    if "part number" not in cols_lower:
+        raise ValueError(
+            f"Input Excel must have a 'Part Number' column. Found: {list(df.columns)}"
+        )
+    if "tier 1" not in cols_lower:
+        raise ValueError(
+            f"Input Excel must have a 'Tier 1' column. Found: {list(df.columns)}"
+        )
+
+    def _find(aliases: tuple[str, ...]) -> Optional[str]:
+        for a in aliases:
+            if a in cols_lower:
+                return cols_lower[a]
+        return None
+
+    cng_q_col  = _find(_CNG_Q_ALIASES)
+    cng_q1_col = _find(_CNG_Q1_ALIASES)
+    if cng_q_col is None or cng_q1_col is None:
+        raise ValueError(
+            "Input Excel must have 'CNG_Q' and 'CNG_Q-1' columns "
+            f"(CNG is now read from the file). Found: {list(df.columns)}"
+        )
+
+    pn_col = cols_lower["part number"]
+    t1_col = cols_lower["tier 1"]
+
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        pn = str(row[pn_col]).strip()
+        t1 = str(row[t1_col]).strip()
+        if not (pn and t1) or (pn, t1) in seen:
+            continue
+        try:
+            cng_q   = float(row[cng_q_col])
+            cng_q_1 = float(row[cng_q1_col])
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Non-numeric CNG value for part '{pn}' / '{t1}'. "
+                "CNG_Q and CNG_Q-1 must be numbers."
+            )
+        seen.add((pn, t1))
+        rows.append({"part_number": pn, "tier_1": t1, "cng_q": cng_q, "cng_q_1": cng_q_1})
+
+    logger.info("Read %d unique (part, tier_1, cng) rows from uploaded file", len(rows))
+    return rows
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUT BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_forecast_workbook(
+def _run_forecasts_uniform(
     part_tier_pairs: list[tuple[str, str]],
     engine: ForecastEngine,
-) -> bytes:
-    """
-    Run forecasts for all (part_number, tier_1) pairs and build output workbook.
-
-    Failed rows show an ERROR message instead of stopping the batch.
-    Returns raw bytes of the generated .xlsx workbook.
-    """
-    # ── Step 1: run engine for every pair ────────────────────────────────
+    cng_q: float,
+    cng_q_1: float,
+    include_current_month: bool,
+) -> dict[tuple[str, str], "ForecastResponse | Exception"]:
+    """Run the engine for every pair using ONE shared CNG_Q / CNG_Q-1."""
     results: dict[tuple[str, str], ForecastResponse | Exception] = {}
-
     for pn, t1 in part_tier_pairs:
         try:
-            results[(pn, t1)] = engine.forecast(part_number=pn, tier_1=t1)
+            results[(pn, t1)] = engine.forecast(
+                part_number=pn, tier_1=t1, cng_q=cng_q, cng_q_1=cng_q_1,
+                include_current_month=include_current_month,
+            )
             logger.debug("Forecast OK: %s / %s", pn, t1)
         except Exception as exc:
             results[(pn, t1)] = exc
             logger.warning("Forecast failed for %s / %s: %s", pn, t1, exc)
+    return results
 
+
+def _run_forecasts_per_row(
+    part_rows: list[dict],
+    engine: ForecastEngine,
+    include_current_month: bool,
+) -> tuple[list[tuple[str, str]], dict[tuple[str, str], "ForecastResponse | Exception"]]:
+    """Run the engine per row, each with its OWN CNG_Q / CNG_Q-1 from the file."""
+    results: dict[tuple[str, str], ForecastResponse | Exception] = {}
+    part_tier_pairs: list[tuple[str, str]] = []
+    for row in part_rows:
+        key = (row["part_number"], row["tier_1"])
+        part_tier_pairs.append(key)
+        try:
+            results[key] = engine.forecast(
+                part_number=key[0], tier_1=key[1],
+                cng_q=row["cng_q"], cng_q_1=row["cng_q_1"],
+                include_current_month=include_current_month,
+            )
+            logger.debug("Forecast OK: %s / %s (CNG_Q=%s)", key[0], key[1], row["cng_q"])
+        except Exception as exc:
+            results[key] = exc
+            logger.warning("Forecast failed for %s / %s: %s", key[0], key[1], exc)
+    return part_tier_pairs, results
+
+
+def build_forecast_workbook(
+    part_tier_pairs: list[tuple[str, str]],
+    engine: ForecastEngine,
+    cng_q: float,
+    cng_q_1: float,
+    include_current_month: bool = False,
+) -> bytes:
+    """
+    Run forecasts for all (part_number, tier_1) pairs with a single shared
+    CNG pair and build the output workbook. Kept for backward compatibility.
+    """
+    results = _run_forecasts_uniform(
+        part_tier_pairs, engine, cng_q, cng_q_1, include_current_month
+    )
+    return _build_workbook_from_results(part_tier_pairs, results)
+
+
+def build_forecast_workbook_from_rows(
+    part_rows: list[dict],
+    engine: ForecastEngine,
+    include_current_month: bool = False,
+) -> bytes:
+    """Run forecasts using per-row CNG (from the file) and build the workbook."""
+    part_tier_pairs, results = _run_forecasts_per_row(
+        part_rows, engine, include_current_month
+    )
+    return _build_workbook_from_results(part_tier_pairs, results)
+
+
+def build_preview_from_rows(
+    part_rows: list[dict],
+    engine: ForecastEngine,
+    include_current_month: bool = False,
+) -> dict:
+    """
+    Run forecasts using per-row CNG and return a JSON-serialisable preview
+    (Summary + one entry per monthly sheet) for on-screen display.
+    """
+    part_tier_pairs, results = _run_forecasts_per_row(
+        part_rows, engine, include_current_month
+    )
+
+    month_labels: list[tuple[str, str]] = []
+    for r in results.values():
+        if isinstance(r, ForecastResponse):
+            month_labels = [(f.year_month, f.month_label) for f in r.forecasts]
+            break
+    if not month_labels:
+        first_error = next(iter(results.values()), None)
+        raise ValueError(
+            f"All parts failed forecasting — nothing to preview. First error: {first_error}"
+        )
+
+    n_ok = sum(1 for r in results.values() if isinstance(r, ForecastResponse))
+    n_failed = len(results) - n_ok
+
+    summary: list[dict] = []
+    for pn, t1 in part_tier_pairs:
+        r = results[(pn, t1)]
+        if isinstance(r, Exception):
+            summary.append({"part_number": pn, "tier_1": t1, "error": str(r)})
+            continue
+        monthly = []
+        for ym, _ in month_labels:
+            mf = next((f for f in r.forecasts if f.year_month == ym), None)
+            monthly.append(mf.predicted_price if mf else None)
+        ctx0 = r.forecasts[0].quarter_context
+        summary.append({
+            "part_number": pn, "tier_1": t1,
+            "weight_lbs": r.pwt_lbs, "base_price": r.base_price,
+            "cng_q": ctx0.cng_q, "cng_q_1": ctx0.cng_q_1,
+            "monthly": monthly, "error": None,
+        })
+
+    monthly_sheets: list[dict] = []
+    for ym, label in month_labels:
+        rows: list[dict] = []
+        for pn, t1 in part_tier_pairs:
+            r = results[(pn, t1)]
+            if isinstance(r, Exception):
+                rows.append({"part_number": pn, "tier_1": t1, "error": str(r)})
+                continue
+            mf = next((f for f in r.forecasts if f.year_month == ym), None)
+            if mf is None:
+                rows.append({"part_number": pn, "tier_1": t1, "error": f"No data for {ym}"})
+                continue
+            q = mf.quarter_context
+            rows.append({
+                "part_number": pn, "tier_1": t1,
+                "weight_lbs": r.pwt_lbs, "base_price_used": mf.base_price_used,
+                "quarter": q.quarter_label,
+                "mc_q": q.mc_q, "mc_q_1": q.mc_q_1,
+                "ppi_q": q.ppi_q, "ppi_q_1": q.ppi_q_1, "ppi_factor": q.ppi_factor,
+                "cng_q": q.cng_q, "cng_q_1": q.cng_q_1,
+                "ams_q": q.ams_q, "ams_q_1": q.ams_q_1, "ams_delta": q.ams_delta,
+                "predicted_price": mf.predicted_price, "error": None,
+            })
+        monthly_sheets.append({"year_month": ym, "label": label, "rows": rows})
+
+    return {
+        "part_count": len(part_tier_pairs),
+        "ok": n_ok,
+        "failed": n_failed,
+        "months": [{"year_month": ym, "month_label": label} for ym, label in month_labels],
+        "summary": summary,
+        "monthly_sheets": monthly_sheets,
+    }
+
+
+def _build_workbook_from_results(
+    part_tier_pairs: list[tuple[str, str]],
+    results: dict[tuple[str, str], "ForecastResponse | Exception"],
+) -> bytes:
+    """
+    Build the formatted .xlsx workbook from already-computed results.
+
+    include_current_month affects the number of monthly sheets via the
+    supplied results. Failed rows show an ERROR message instead of stopping
+    the batch. Returns raw bytes of the generated .xlsx workbook.
+    """
     # ── Step 2: determine month labels from first successful result ───────
     month_labels: list[tuple[str, str]] = []
     for r in results.values():
@@ -197,7 +416,11 @@ def build_forecast_workbook(
             break
 
     if not month_labels:
-        raise ValueError("All parts failed forecasting — cannot generate output workbook.")
+        first_error = next(iter(results.values()), None)
+        raise ValueError(
+            "All parts failed forecasting — cannot generate output workbook. "
+            f"First error: {first_error}"
+        )
 
     # ── Step 3: build workbook ────────────────────────────────────────────
     wb = openpyxl.Workbook()
