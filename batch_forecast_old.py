@@ -3,8 +3,7 @@ Batch forecast service.
 
 Reads (Part Number, Tier 1) pairs from an uploaded Excel, runs the
 forecast engine for each unique combination, and writes a result
-workbook with one sheet per forecast month (12 sheets, or 13 when the
-current month is included) plus a Summary.
+workbook with one sheet per forecast month (12 sheets) plus a Summary.
 
 COLUMN LAYOUT (per monthly sheet)
 ──────────────────────────────────
@@ -62,14 +61,14 @@ def _build_columns() -> list[tuple[str, str, callable]]:
         ("Quarter\n(Current)",   "@",             lambda pn, t1, fr, mf: _ctx(mf).quarter_label),
         ("Quarter\n(Previous)",  "@",             lambda pn, t1, fr, mf: _ctx(mf).prev_quarter_label),
         ("MC_Q\n($/lb)",         "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q),
-        ("MC_Q-1\n($/lb)",       "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q_1),
+        ("MC_Q-1\n($/lb)",       "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).mc_q_prev),
         ("PPI_Q",                "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q),
-        ("PPI_Q-1",              "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q_1),
+        ("PPI_Q-1",              "0.000",         lambda pn, t1, fr, mf: _ctx(mf).ppi_q_prev),
         ("PPI Factor",           "0.000000%",     lambda pn, t1, fr, mf: _ctx(mf).ppi_factor),
         ("CNG_Q\n($/lb)",        "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q),
-        ("CNG_Q-1\n($/lb)",      "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q_1),
+        ("CNG_Q-1\n($/lb)",      "$0.0000",       lambda pn, t1, fr, mf: _ctx(mf).cng_q_prev),
         ("AMS_Q\n($/lb)",        "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q),
-        ("AMS_Q-1\n($/lb)",      "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q_1),
+        ("AMS_Q-1\n($/lb)",      "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_q_prev),
         ("AMS Delta\n($/lb)",    "$0.000000",     lambda pn, t1, fr, mf: _ctx(mf).ams_delta),
         ("DF_c",                 "0.00",          lambda pn, t1, fr, mf: mf.df_c),
         ("Predicted Price\n($)", "$#,##0.0000",   lambda pn, t1, fr, mf: mf.predicted_price),
@@ -172,15 +171,9 @@ def read_parts_from_upload(file_bytes: bytes) -> list[tuple[str, str]]:
 def build_forecast_workbook(
     part_tier_pairs: list[tuple[str, str]],
     engine: ForecastEngine,
-    cng_q: float,
-    cng_q_1: float,
-    include_current_month: bool = False,
 ) -> bytes:
     """
     Run forecasts for all (part_number, tier_1) pairs and build output workbook.
-
-    include_current_month=True adds the current month as the first forecast
-    month (13 monthly sheets instead of 12).
 
     Failed rows show an ERROR message instead of stopping the batch.
     Returns raw bytes of the generated .xlsx workbook.
@@ -190,13 +183,7 @@ def build_forecast_workbook(
 
     for pn, t1 in part_tier_pairs:
         try:
-            results[(pn, t1)] = engine.forecast(
-                part_number=pn,
-                tier_1=t1,
-                cng_q=cng_q,
-                cng_q_1=cng_q_1,
-                include_current_month=include_current_month,
-            )
+            results[(pn, t1)] = engine.forecast(part_number=pn, tier_1=t1)
             logger.debug("Forecast OK: %s / %s", pn, t1)
         except Exception as exc:
             results[(pn, t1)] = exc
@@ -210,11 +197,7 @@ def build_forecast_workbook(
             break
 
     if not month_labels:
-        first_error = next(iter(results.values()), None)
-        raise ValueError(
-            "All parts failed forecasting — cannot generate output workbook. "
-            f"First error: {first_error}"
-        )
+        raise ValueError("All parts failed forecasting — cannot generate output workbook.")
 
     # ── Step 3: build workbook ────────────────────────────────────────────
     wb = openpyxl.Workbook()
