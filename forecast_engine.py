@@ -79,6 +79,19 @@ def _quarter_label(year: int, quarter: int) -> str:
     return f"Q{quarter}-{year}"
 
 
+# ── NEW MODIFICATION ────────────────────────────────────────
+def _month_position_in_quarter(month: int) -> int:
+    """
+    Return 1, 2 or 3 for a given calendar month (1-12), marking its
+    position inside its own quarter.
+    Quarter 1 (Jan, Feb, Mar)  -> 1, 2, 3
+    Quarter 2 (Apr, May, Jun)  -> 1, 2, 3
+    Quarter 3 (Jul, Aug, Sep)  -> 1, 2, 3
+    Quarter 4 (Oct, Nov, Dec)  -> 1, 2, 3
+    Position 3 always means "last month of the quarter".
+    """
+    return ((month - 1) % 3) + 1
+
 # ---------------------------------------------------------------------------
 # DATA FETCH HELPERS  (raise ValueError if data is unavailable)
 # ---------------------------------------------------------------------------
@@ -460,11 +473,15 @@ class ForecastEngine:
         # ── MODIFICATION ────────────────────────────────────────
         # NEW: 50-day implementation lag (2 months) and +/-2% deadband.
         # Read from settings if defined there, otherwise use these defaults.
-        price_lag = getattr(settings, "PRICE_LAG_MONTHS", 2)
+        ## price_lag = getattr(settings, "PRICE_LAG_MONTHS", 2)
         deadband = getattr(settings, "DEADBAND_PCT", 0.02)
 
+        # ── NEW MODIFICATION ────────────────────────────────────────
+        active_base = base_price
+        pending_first_month_price: Optional[float] = None
+
         # NEW: price calculated in each step (goes live `price_lag` months later)
-        calculated_prices: list[float] = []
+        ## calculated_prices: list[float] = []
 
         for step in range(n_months):
             year_month_key = f"{forecast_year}-{forecast_month:02d}"
@@ -473,10 +490,17 @@ class ForecastEngine:
             #   first `price_lag` months -> original base price (e.g. Sep for Oct, Nov)
             #   later months             -> price calculated `price_lag` months ago
             #                               (Oct's price is the base for Dec, ...)
-            # ── MODIFICATION ────────────────────────────────────────
-            current_price = (
-                base_price if step < price_lag else calculated_prices[step - price_lag]
-            )
+
+            # ── NEW MODIFICATION ────────────────────────────────────────
+            position = _month_position_in_quarter(forecast_month)
+            is_first_month_of_quarter = (position == 1)
+            is_last_month_of_quarter = (position == 3)
+            #   1st or 2nd month of the quarter -> active_base (unchanged all quarter)
+            #   3rd (last) month of the quarter -> this quarter's own 1st month price
+            if is_last_month_of_quarter and pending_first_month_price is not None:
+                current_price = pending_first_month_price
+            else:
+                current_price = active_base
 
             # -- Build context for this month (MC_Q / PPI_Q vary per month) --
             try:
@@ -543,10 +567,19 @@ class ForecastEngine:
                    is_data_projected=(step >= 1),
                 )
             )
-            # CHANGED: no more rolling of predicted price into the next base.
-            # Remember this month's price; it becomes a base `price_lag` months later.
-            # ── MODIFICATION ────────────────────────────────────────
-            calculated_prices.append(predicted_price)
+
+            # ── NEW MODIFICATION ────────────────────────────────────────
+            # CHANGED: remember this quarter's 1st-month result for later use at its 3rd month
+            if is_first_month_of_quarter:
+                pending_first_month_price = predicted_price
+ 
+            # CHANGED: when this was the quarter's last month, the base it just used
+            # becomes the active base going forward (carried into the next quarter's
+            # 1st and 2nd months), and we reset for the next quarter.
+            if is_last_month_of_quarter:
+                active_base = current_price
+                pending_first_month_price = None
+    
             forecast_year, forecast_month = _advance_month(forecast_year, forecast_month)
         logger.info(
             "Forecast complete for part=%s: %d months, "
