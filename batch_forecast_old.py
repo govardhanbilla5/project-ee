@@ -1,823 +1,674 @@
-r"""
-Batch forecast service.
-
-Reads (Part Number, Tier 1) pairs from an uploaded Excel, runs the
-forecast engine for each unique combination, and writes a result
-workbook with one sheet per forecast month (12 sheets, or 13 when the
-current month is included) plus a Summary.
-
-COLUMN LAYOUT (per monthly sheet)
-──────────────────────────────────
-Part Number | Tier 1 | Weight (lbs) | Base Price ($) |
-Quarter (Current) | Quarter (Previous) |
-MC_Q ($/lb) | MC_Q-1 ($/lb) |
-PPI_Q | PPI_Q-1 | PPI Factor |
-CNG_Q ($/lb) | CNG_Q-1 ($/lb) |
-AMS_Q ($/lb) | AMS_Q-1 ($/lb) | AMS Delta ($/lb) |
-DF_c | Predicted Price ($)
+"""
+Aluminium Price Forecast Engine.
+FORMULA REFERENCE
+-----------------
+P_next = P_current
+         + [(AMS_Q - AMS_Q-1) x PWt]
+         + (PPI_Factor x P_current)
+Where:
+  AMS_Q     = (MC_Q x DF_c) + CNG_Q
+  AMS_Q-1   = (MC_Q-1 x DF_c) + CNG_Q-1
+  ### MC_Q      = (LME + MWP of the month being PREDICTED) + 0.558883       # CHANGED (offset 0.558883 in config)
+  ### MC_Q-1    = (LME + MWP of the LAST month of the previous quarter) + 0.558883  # CHANGED (offset 0.558883 in config)
+              when that quarter is covered by actuals, otherwise the       # CHANGED
+              AVERAGE of MC of its 3 months
+  PPI_Factor = (PPI_Q - PPI_Q-1) / PPI_Q-1
+      where PPI_Q   = PPI of the month being PREDICTED
+            PPI_Q-1 = PPI of the LAST month of the previous quarter
+                      when that whole quarter is covered by published
+                      actuals (actuals lag the current month by
+                     PPI_ACTUAL_LAG_MONTHS), otherwise the AVERAGE
+                      of its 3 (projected) months
+  CNG_Q     = supplied in the request, constant for every month
+  CNG_Q-1   = supplied in the request, constant for every month
+  DF_c      = 1.44 (constant)
+  PWt       = part weight in lbs (per part number)
+ITERATION LOGIC
+---------------
+P_current (base price) of a month is NOT the previous predicted price any more:
+  - first PRICE_LAG_MONTHS (2) months  -> the original base price
+  - later months                       -> predicted price of (month - 2)
+    (a price calculated in Oct becomes effective / base in Dec, 50-day lag)
+DEADBAND: if the calculated price is within +/-2% of the base price,
+the base price is retained (no change).
 """
 
-import io
 import logging
-from typing import Optional
-
-import openpyxl
-import pandas as pd
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-
-from app.models.response import ForecastResponse
-from app.services.forecast_engine import ForecastEngine
-
-
-# ======================================================================
-# NEW - AOP
-# This is the new feature as per thapase/srikanth requirements on 10/20/2026
-# Importing dependencies for calling AOP calculation methods
-# Importing dependencies for ppi and lme prediction
-from app.services.forecast_engine import ForecastEngine, compute_total_aop   # NEW - AOP
-from app.data.excel_store import _load_aop_lookup                            # NEW - AOP
-# For ppi forecast
-from app.services.ppi_forecast import refresh_ppi_forecast,reset_backup_flag            # NEW - PPI
-from app.services.lme_forecast import refresh_lme_forecast              # NEW - LME
-from app.services.aop_sync import refresh_aop_from_input              # NEW - AOP
-# ======================================================================
-
+from calendar import monthrange
+from datetime import date, datetime, timezone
+from typing import Optional,NamedTuple
+from app.core.config import settings
+from app.data.base import MarketDataRepository, PartRepository
+from app.models.response import PriceFactorBreakdown, PriceChangeBreakdown
+from app.models.response import (
+    ForecastResponse,
+    MonthForecast,
+    QuarterContext,
+)
 logger = logging.getLogger(__name__)
-
 # ─────────────────────────────────────────────────────────────────────────────
-# STYLING
+# QUARTER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+def _quarter_of_month(month: int) -> int:
+    """Return 1-4 for a given month number (1-12)."""
+    return (month - 1) // 3 + 1
 
-_THIN        = Side(style="thin", color="BFBFBF")
-_BORDER      = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
-_HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-_ALT_FILL    = PatternFill("solid", fgColor="D6E4F0")
-_WHITE_FILL  = PatternFill("solid", fgColor="FFFFFF")
-_WARN_FILL   = PatternFill("solid", fgColor="FCE4D6")
-_HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-_DATA_FONT   = Font(name="Arial", size=10)
-_WARN_FONT   = Font(name="Arial", size=10, color="C00000")
-_CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
-_LEFT        = Alignment(horizontal="left",   vertical="center")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def _build_columns() -> list[tuple[str, str, callable]]:
-    def _ctx(mf): return mf.quarter_context
-    return [
-        ("Part Number",          "@",             lambda pn, t1, fr, mf: pn),
-        ("Tier 1",               "@",             lambda pn, t1, fr, mf: t1),
-        ("Weight\n(lbs)",        "0.00",          lambda pn, t1, fr, mf: fr.pwt_lbs),
-        ("Base Price\n($)",      "$#,##0.00",   lambda pn, t1, fr, mf: round(mf.base_price_used, 2)),
-        ("Quarter\n(Current)",   "@",             lambda pn, t1, fr, mf: _ctx(mf).quarter_label),
-        ("Quarter\n(Previous)",  "@",             lambda pn, t1, fr, mf: _ctx(mf).prev_quarter_label),
-        ("MC_Q\n($/lb)",         "$0.00",     lambda pn, t1, fr, mf: round(_ctx(mf).mc_q, 2)),
-        ("MC_Q-1\n($/lb)",       "$0.00",     lambda pn, t1, fr, mf: round(_ctx(mf).mc_q_1, 2)),
-        ("PPI_Q",                "0.0",         lambda pn, t1, fr, mf: round(_ctx(mf).ppi_q, 1)),
-        ("PPI_Q-1",              "0.0",         lambda pn, t1, fr, mf: round(_ctx(mf).ppi_q_1, 1)),
-        ("PPI Factor",           "0.000",      lambda pn, t1, fr, mf: round(_ctx(mf).ppi_factor, 3)),
-        ("CNG_Q\n($/lb)",        "General",       lambda pn, t1, fr, mf: _ctx(mf).cng_q),
-        ("CNG_Q-1\n($/lb)",      "General",       lambda pn, t1, fr, mf: _ctx(mf).cng_q_1),
-        ("AMS_Q\n($/lb)",        "$0.00",     lambda pn, t1, fr, mf: round(_ctx(mf).ams_q, 2)),
-        ("AMS_Q-1\n($/lb)",      "$0.00",     lambda pn, t1, fr, mf: round(_ctx(mf).ams_q_1, 2)),
-        ("AMS Delta\n($/lb)",    "$0.00",     lambda pn, t1, fr, mf: round(_ctx(mf).ams_delta, 2)),
-        ("DF_c",                 "General",          lambda pn, t1, fr, mf: mf.df_c),
-         # ── MODIFICATION ────────────────────────────────────────
-        ("Predicted Price", "$#,##0.00", lambda pn, t1, fr, mf: round(mf.predicted_price_without_deadband, 2)),   # NEW
-        ("Final Unit Price (with Deadband)", "$#,##0.00",   lambda pn, t1, fr, mf: round(mf.predicted_price, 2)),  
-       
-
-    ]
-
-
-COLUMNS = _build_columns()
-N_COLS  = len(COLUMNS)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _write_header(ws, col_idx: int, label: str) -> None:
-    cell = ws.cell(row=1, column=col_idx, value=label)
-    cell.font = _HEADER_FONT; cell.fill = _HEADER_FILL
-    cell.alignment = _CENTER; cell.border = _BORDER
-
-
-def _write_data(ws, row: int, col: int, value, fmt: str, fill, left=False) -> None:
-    cell = ws.cell(row=row, column=col, value=value)
-    cell.font = _DATA_FONT; cell.fill = fill; cell.border = _BORDER
-    cell.number_format = fmt
-    cell.alignment = _LEFT if left else _CENTER
-
-
-def _write_error_row(ws, row: int, part_number: str, tier_1: str, error_msg: str, fill) -> None:
-    for col, val in [(1, part_number), (2, tier_1)]:
-        c = ws.cell(row=row, column=col, value=val)
-        c.font = _WARN_FONT; c.fill = _WARN_FILL
-        c.border = _BORDER; c.alignment = _LEFT
-
-    err = ws.cell(row=row, column=3, value=f"ERROR: {error_msg}")
-    err.font = _WARN_FONT; err.fill = _WARN_FILL
-    err.border = _BORDER; err.alignment = _LEFT
-    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=N_COLS)
-
-
-def _set_col_widths(ws) -> None:
-    widths = [22, 22, 10, 14, 14, 14, 13, 13, 10, 10, 13, 13, 13, 13, 13, 13, 8, 18]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.row_dimensions[1].height = 36
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INPUT READER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def read_parts_from_upload(file_bytes: bytes) -> list[tuple[str, str]]:
+def _quarter_months(year: int, quarter: int) -> list[str]:
     """
-    Read (Part Number, Tier 1) pairs from the uploaded Excel file.
-
-    Expects columns named 'Part Number' and 'Tier 1' (case-insensitive).
-    Returns a deduplicated list of (part_number, tier_1) tuples,
-    preserving input order.
+    Return the three 'YYYY-MM' keys that make up a calendar quarter.
+    Quarter 1 → Jan, Feb, Mar  (months 1, 2, 3)
+    Quarter 2 → Apr, May, Jun  (months 4, 5, 6)
+    Quarter 3 → Jul, Aug, Sep  (months 7, 8, 9)
+    Quarter 4 → Oct, Nov, Dec  (months 10, 11, 12)
     """
-    df = pd.read_excel(
-        io.BytesIO(file_bytes),
-        engine="openpyxl",
-        dtype=str,
-        keep_default_na=False,
-        na_values=[""],
+    first_month = (quarter - 1) * 3 + 1
+    return [f"{year}-{m:02d}" for m in range(first_month, first_month + 3)]
+
+def _last_month_of_quarter(year: int, quarter: int) -> str:
+    """Return the 'YYYY-MM' key of the last month of a quarter."""
+    last_month = quarter * 3
+    return f"{year}-{last_month:02d}"
+
+def _prev_quarter(year: int, quarter: int) -> tuple[int, int]:
+    """Return (year, quarter) of the preceding quarter."""
+    if quarter == 1:
+        return year - 1, 4
+    return year, quarter - 1
+
+def _quarter_label(year: int, quarter: int) -> str:
+    return f"Q{quarter}-{year}"
+
+# ── NEW MODIFICATION ────────────────────────────────────────
+def _month_position_in_quarter(month: int) -> int:
+    """
+    Return 1, 2 or 3 for a given calendar month (1-12), marking its
+    position inside its own quarter.
+    Quarter 1 (Jan, Feb, Mar)  -> 1, 2, 3
+    Quarter 2 (Apr, May, Jun)  -> 1, 2, 3
+    Quarter 3 (Jul, Aug, Sep)  -> 1, 2, 3
+    Quarter 4 (Oct, Nov, Dec)  -> 1, 2, 3
+    Position 3 always means "last month of the quarter".
+    """
+    return ((month - 1) % 3) + 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA FETCH HELPERS  (raise ValueError if data is unavailable)
+# ─────────────────────────────────────────────────────────────────────────────
+def _require(value: Optional[float], description: str) -> float:
+    if value is None:
+        raise ValueError(f"Required data unavailable: {description}")
+    return value
+
+
+class _MCResult(NamedTuple):
+    mc:      float   # (LME + Midwest) × 0.91 + 1.25  — used in formula
+    lme:     float   # LME for the month              — used in breakdown
+    midwest: float   # Midwest for the month          — used in breakdown
+
+def _compute_mc(
+    year_month: str,
+    market_repo: MarketDataRepository,
+) -> _MCResult:
+    """
+    MC = (LME + Midwest premium) × MC_MULTIPLIER + MC_OFFSET for a single
+    'YYYY-MM' month (0.91 and 1.25 by default, see config).
+    Returns a named tuple with the combined value AND the two raw components
+    separately so the caller can use them for factor breakdown without
+    re-fetching data.
+    """
+    lme = _require(market_repo.get_lme(year_month), f"LME for {year_month}")
+    mwp = _require(
+        market_repo.get_midwest_premium(year_month), f"Midwest premium for {year_month}"
     )
 
-    cols_lower = {c.strip().lower(): c for c in df.columns}
 
-    if "part number" not in cols_lower:
-        raise ValueError(
-            f"Input Excel must have a 'Part Number' column. "
-            f"Found: {list(df.columns)}"
-        )
-    if "tier 1" not in cols_lower:
-        raise ValueError(
-            f"Input Excel must have a 'Tier 1' column. "
-            f"Found: {list(df.columns)}"
-        )
-
-    pn_col = cols_lower["part number"]
-    t1_col = cols_lower["tier 1"]
-
-    seen: set[tuple[str, str]] = set()
-    pairs: list[tuple[str, str]] = []
-    for _, row in df.iterrows():
-        pn = str(row[pn_col]).strip()
-        t1 = str(row[t1_col]).strip()
-        if pn and t1 and (pn, t1) not in seen:
-            seen.add((pn, t1))
-            pairs.append((pn, t1))
-
-    logger.info("Read %d unique (part, tier_1) pairs from uploaded file", len(pairs))
-    return pairs
+    # ── MODIFICATION ────────────────────────────────────────
+    # Old formula (no longer used): (lme + mwp) * settings.MC_MULTIPLIER + settings.MC_OFFSET
+    mc = (lme + mwp) + settings.MC_OFFSET
+    logger.debug("MC_%s: LME=%.4f  MWP=%.4f  MC=%.4f", year_month, lme, mwp, mc)
+    return _MCResult(mc=mc, lme=lme, midwest=mwp)
 
 
-# CNG column name aliases (case-insensitive, matched against stripped headers).
-_CNG_Q_ALIASES  = ("cng_q", "cng q", "cng_q current", "cng current", "cng - current qtr")
-_CNG_Q1_ALIASES = ("cng_q-1", "cng_q1", "cng q-1", "cng_q_1", "cng previous", "cng - previous qtr")
 
-
-def read_parts_with_cng_from_upload(file_bytes: bytes) -> list[dict]:
+def _ppi_prev_quarter(
+    market_repo: MarketDataRepository,
+    prev_year: int,
+    prev_quarter: int,
+    current_month: str,
+) -> tuple[float, str]:
     """
-    Read (Part Number, Tier 1, CNG_Q, CNG_Q-1) rows from the uploaded Excel.
+    PPI_Q-1 for the previous quarter, plus a short description of how it was
+    obtained (for logging).
 
-    The CNG values are taken straight from the file — the caller no longer
-    supplies them. Expects columns 'Part Number', 'Tier 1', 'CNG_Q' and
-    'CNG_Q-1' (case-insensitive; a few common spellings are accepted).
-    Returns a deduplicated list of dicts, preserving input order:
-        {"part_number", "tier_1", "cng_q", "cng_q_1"}
+    Published PPI actuals lag the current month by PPI_ACTUAL_LAG_MONTHS
+    (2 → sitting in September, actuals run through July); later rows in the
+    sheet are projections. When the whole previous quarter is covered by
+    actuals we use the ACTUAL of its last month; otherwise the quarter is
+    (partly) projected, so we average all three months instead.
     """
-    df = pd.read_excel(
-        io.BytesIO(file_bytes),
-        engine="openpyxl",
-        dtype=str,
-        keep_default_na=False,
-        na_values=[""],
+    months = _quarter_months(prev_year, prev_quarter)
+    last_month = months[-1]
+    # 'YYYY-MM' strings sort chronologically, so plain comparison works.
+    if last_month <= _shift_month(current_month, -settings.PPI_ACTUAL_LAG_MONTHS):
+        ppi = _require(market_repo.get_ppi(last_month), f"PPI for {last_month}")
+        return ppi, f"actual PPI of {last_month}"
+    values = [_require(market_repo.get_ppi(m), f"PPI for {m}") for m in months]
+    return sum(values) / 3, f"average of projected PPI {months[0]}..{last_month}"
+
+def _compute_quarter_context(
+    year: int,
+    month: int,
+    market_repo: MarketDataRepository,
+    df_c: float,
+    cng_q: float,
+    cng_q_1: float,
+    current_month: str,
+) -> QuarterContext:
+    """
+    Build the full QuarterContext for the month being predicted.
+      MC_Q / PPI_Q     → the predicted month itself
+      MC_Q-1           → last month of the previous quarter
+      PPI_Q-1          → last month of the previous quarter when that quarter
+                         is fully covered by PPI actuals, else the average of
+                         its three months
+      CNG_Q / CNG_Q-1  → fixed values supplied in the request
+    Raises ValueError if any required data is missing.
+    """
+    quarter = _quarter_of_month(month)
+    prev_year, prev_quarter = _prev_quarter(year, quarter)
+    # ── Current (predicted) month ─────────────────────────────────────────
+    target_month = f"{year}-{month:02d}"
+    mc_result = _compute_mc(target_month, market_repo)
+    ppi_q = _require(market_repo.get_ppi(target_month), f"PPI for {target_month}")
+    ams_q = (mc_result.mc * df_c) + cng_q
+
+    # ── Previous quarter ──────────────────────────────────────────────────
+    last_month_q_prev = _last_month_of_quarter(prev_year, prev_quarter)
+    
+    # ── MODIFICATION ────────────────────────────────────────
+    # MC_Q-1 = (LME + Midwest) + MC_OFFSET for the last month of the previous quarter when that quarter is covered by actuals, else the average of its three months (same rule as PPI_Q-1).
+    # otherwise the 3-month average (same rule as PPI_Q-1).
+    if last_month_q_prev <= _shift_month(current_month, -settings.PPI_ACTUAL_LAG_MONTHS):
+        mc_result_prev = _compute_mc(last_month_q_prev, market_repo)
+    else:
+        prev_mc_list = [
+            _compute_mc(m, market_repo) for m in _quarter_months(prev_year, prev_quarter)
+        ]
+        # Average MC, LME and Midwest separately here
+        mc_result_prev = _MCResult(
+            mc=sum(r.mc for r in prev_mc_list) / 3,
+            lme=sum(r.lme for r in prev_mc_list) / 3,
+            midwest=sum(r.midwest for r in prev_mc_list) / 3,
+        )
+    # ───────────────────────────────────────────────────────────
+    
+  
+    ppi_q_prev, ppi_q_prev_basis = _ppi_prev_quarter(
+        market_repo, prev_year, prev_quarter, current_month
+    )
+    ams_q_prev = (mc_result_prev.mc * df_c) + cng_q_1
+    # ── Derived factors ──────────────────────────────────────────────────
+    if ppi_q_prev == 0:
+        raise ValueError(
+            f"PPI_Q-1 is zero for {_quarter_label(prev_year, prev_quarter)} "
+            "— cannot compute PPI_Factor"
+        )
+    ppi_factor = (ppi_q - ppi_q_prev) / ppi_q_prev
+    ams_delta = ams_q - ams_q_prev
+    logger.debug(
+        "QuarterContext %s: MC_Q=%.4f AMS_Q=%.4f | MC_Q-1(%s)=%.4f AMS_Q-1=%.4f | "
+        "PPI_Q-1=%.4f (%s) PPI_Factor=%.6f AMS_delta=%.4f",
+        target_month,
+        mc_result.mc, ams_q, last_month_q_prev, mc_result_prev.mc, ams_q_prev,
+        ppi_q_prev, ppi_q_prev_basis, ppi_factor, ams_delta,
+    )
+    return QuarterContext(
+        quarter_label=_quarter_label(year, quarter),
+        mc_q=round(mc_result.mc, 6),
+        lme_q=round(mc_result.lme, 6),
+        midwest_q=round(mc_result.midwest, 6),
+        ppi_q=round(ppi_q, 4),
+        cng_q=round(cng_q, 6),
+        ams_q=round(ams_q, 6),
+        prev_quarter_label=_quarter_label(prev_year, prev_quarter),
+        mc_q_1=round(mc_result_prev.mc, 6),
+        lme_q_1=round(mc_result_prev.lme, 6),
+        midwest_q_1=round(mc_result_prev.midwest, 6),
+        ppi_q_1=round(ppi_q_prev, 4),
+        cng_q_1=round(cng_q_1, 6),
+        ams_q_1=round(ams_q_prev, 6),
+        ppi_factor=round(ppi_factor, 8),
+        ams_delta=round(ams_delta, 6),
+    )
+# ─────────────────────────────────────────────────────────────────────────────
+# MONTH LABEL HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+def _month_label(year_month: str) -> str:
+    year, month = year_month.split("-")
+    return f"{_MONTH_NAMES[int(month) - 1]} {year}"
+
+def _advance_month(year: int, month: int) -> tuple[int, int]:
+    """Return (year, month) one calendar month later."""
+    if month == 12:
+        return year + 1, 1
+    return year, month + 1
+
+def _prev_month(year: int, month: int) -> tuple[int, int]:
+    """Return (year, month) one calendar month earlier."""
+    if month == 1:
+        return year - 1, 12
+    return year, month - 1
+
+def _shift_month(year_month: str, delta: int) -> str:
+    """Shift a 'YYYY-MM' key by *delta* calendar months (delta may be negative)."""
+    year, month = map(int, year_month.split("-"))
+    total = year * 12 + (month - 1) + delta
+    return f"{total // 12}-{total % 12 + 1:02d}"
+
+def _price_month_error(
+    parts: PartRepository,
+    part_number: str,
+    tier_1: str,
+    needed_month: str,
+    include_current_month: bool,
+) -> ValueError:
+    """Explain why no P_current was found for *needed_month*."""
+    data_month = parts.get_price_month()
+    if data_month is not None and data_month != needed_month:
+        flag = "YES" if include_current_month else "NO"
+        return ValueError(
+            f"Part prices in the data store are for {_month_label(data_month)}, but "
+            f"include_current_month={flag} needs {_month_label(needed_month)} prices "
+            "as P_current. Update the price column (and the month in its header) "
+            "or change include_current_month."
+        )
+    return ValueError(
+        f"Current price not available for part_number='{part_number}' "
+        f"tier_1='{tier_1}' month={needed_month}. Make sure the price column "
+        "header names its month, e.g. 'Current Price ($) Aug 2026'."
     )
 
-    cols_lower = {c.strip().lower(): c for c in df.columns}
+def _compute_price_breakdown(
+    ctx: "QuarterContext",
+    current_price: float,
+    predicted_price: float,
+    pwt: float,
+    df_c: float,
+) -> PriceChangeBreakdown:
+    """
+    Decompose the price change into four exact, non-overlapping factors.
+    Formula proof:
+      total_change = predicted - current
+                   = [(AMS_Q - AMS_Q-1) × PWt] + [PPI_Factor × P_current]
+                   = [(MC_Q - MC_Q-1) × DF_c + (CNG_Q - CNG_Q-1)] × PWt
+                     + PPI_Factor × P_current
+                   = (lme_delta + midwest_delta) × 0.91 × DF_c × PWt
+                     + cng_delta × PWt
+                     + ppi_factor × P_current
+    All four effects are mathematically exact and always sum to total_change.
+    """
+    
+    total_change = round(predicted_price - current_price, 6)
+    lme_delta     = ctx.lme_q     - ctx.lme_q_1
+    midwest_delta = ctx.midwest_q - ctx.midwest_q_1
+    cng_delta     = ctx.cng_q     - ctx.cng_q_1
+    
+    # ALL the effects are computed using the new formula and the MC_MULTIPLIER is no longer used in the calculations. The effects are calculated based on the deltas of LME, Midwest, CNG, and PPI, multiplied by the part weight and correction factor where applicable.
+    # ── MODIFICATION ────────────────────────────────────────
+    # Removed the MC_MULTIPLIER from the calculations as per the new requirements from thapase/srikanth on 09/30/2026. 
+    lme_effect = round(lme_delta * df_c * pwt, 6)#####round(lme_delta * settings.MC_MULTIPLIER * df_c * pwt, 6)
+    midwest_effect = round(midwest_delta * df_c * pwt, 6)  #####round(midwest_delta * settings.MC_MULTIPLIER * df_c * pwt, 6)
+    cng_effect     = round(cng_delta     * pwt,        6)
+    ppi_effect     = round(ctx.ppi_factor * current_price, 6)
+    sum_of_effects = round(lme_effect + midwest_effect + cng_effect + ppi_effect, 6)
+    sum_check      = round(sum_of_effects - total_change, 6)
 
-    if "part number" not in cols_lower:
-        raise ValueError(
-            f"Input Excel must have a 'Part Number' column. Found: {list(df.columns)}"
-        )
-    if "tier 1" not in cols_lower:
-        raise ValueError(
-            f"Input Excel must have a 'Tier 1' column. Found: {list(df.columns)}"
-        )
+    def _pct(effect: float) -> float:
+        # Percentage of base price — always stable and interpretable.
+        # e.g. +0.56% means this factor added 0.56% upward pressure on the price,
+        # regardless of how small the net total change is.
+        return round((effect / current_price) * 100, 4)
+    
+    return PriceChangeBreakdown(
+        base_price=round(current_price, 4),
+        predicted_price=round(predicted_price, 4),
+        total_change=total_change,
+        lme_effect=PriceFactorBreakdown(
+            dollar_effect=lme_effect,
+            percentage_of_base=_pct(lme_effect),
+        ),
+        midwest_effect=PriceFactorBreakdown(
+            dollar_effect=midwest_effect,
+            percentage_of_base=_pct(midwest_effect),
+        ),
+            
+        cng_effect=PriceFactorBreakdown(
+            dollar_effect=cng_effect,
+            percentage_of_base=_pct(cng_effect),
+        ),
+        ppi_effect=PriceFactorBreakdown(
+            dollar_effect=ppi_effect,
+            percentage_of_base=_pct(ppi_effect),
+        ),
+        sum_check=sum_check,
+    )
 
-    def _find(aliases: tuple[str, ...]) -> Optional[str]:
-        for a in aliases:
-            if a in cols_lower:
-                return cols_lower[a]
+
+# ======================================================================
+# NEW - AOP (Annual Operating Plan) helpers.
+# To get AOP quantity values
+# This is the new feature as per thapase/srikanth requirements on 10/20/2026
+
+_AOP_MONTH_FORMATS = ("%B %Y", "%b %Y", "%B-%Y", "%b-%Y", "%b'%y", "%b-%y", "%b %y", "%Y-%m")
+def _aop_month_key(header) -> Optional[str]:
+    """Convert a header (Excel date, 'Oct 2026', 'Oct-2026', '2026-10' ...) to 'YYYY-MM'."""
+    if isinstance(header, (datetime, date)):
+        return f"{header.year}-{header.month:02d}"
+
+    text = str(header or "").strip()
+    for fmt in _AOP_MONTH_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return f"{parsed.year}-{parsed.month:02d}"
+        except ValueError:
+            continue
+    return None
+
+def _aop_part_key(value) -> str:
+    """Excel may store part 221134 as 221134.0 - normalise to plain text."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
+
+
+def build_aop_lookup(rows: list[list]) -> dict[tuple[str, str, str], float]:
+    """
+    AOP sheet as list of rows. Row 0 = header:
+        Part Number | Tier 1 | Oct 2026 | Nov 2026 | ...
+    Returns {(part_number, tier_1, 'YYYY-MM'): aop_qty}. Blank / non-numeric cells are skipped.
+    """
+    if not rows:
+        return {}
+    month_cols = {i: _aop_month_key(h) for i, h in enumerate(rows[0]) if i >= 2 and _aop_month_key(h)}
+    lookup: dict[tuple[str, str, str], float] = {}
+    for row in rows[1:]:
+        if not row or row[0] in (None, ""):
+            continue
+        part = _aop_part_key(row[0])
+        tier = _aop_part_key(row[1]) if len(row) > 1 else ""
+        for col, ym in month_cols.items():
+            qty = row[col] if col < len(row) else None
+            if qty in (None, ""):
+                continue
+            try:
+                lookup[(part, tier, ym)] = float(qty)
+            except (TypeError, ValueError):
+                continue
+    return lookup
+
+def compute_total_aop(unit_price: float, aop_qty: Optional[float]) -> Optional[float]:
+    """Total AOP value = AOP qty x unit price. No AOP qty -> None (blank cell)."""
+    if aop_qty is None:
         return None
+    return round(unit_price * aop_qty, 2)
+# ======================================================================
 
-    cng_q_col  = _find(_CNG_Q_ALIASES)
-    cng_q1_col = _find(_CNG_Q1_ALIASES)
-    if cng_q_col is None or cng_q1_col is None:
-        raise ValueError(
-            "Input Excel must have 'CNG_Q' and 'CNG_Q-1' columns "
-            f"(CNG is now read from the file). Found: {list(df.columns)}"
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+class ForecastEngine:
+    """
+    Stateless forecasting engine.  Depends only on the abstract repository
+    interfaces — no concrete data source is referenced here.
+    """
+    def __init__(
+        self,
+        market_repo: MarketDataRepository,
+        part_repo: PartRepository,
+    ) -> None:
+        self._market = market_repo
+        self._parts = part_repo
+        self._df_c = settings.DF_C
+        self._horizon = settings.FORECAST_HORIZON_MONTHS
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC API
+    # ─────────────────────────────────────────────────────────────────────
+    def forecast(
+        self,
+        part_number: str,
+        tier_1: str,
+        cng_q: float,
+        cng_q_1: float,
+        include_breakdown: bool = False,
+        include_current_month: bool = False,
+    ) -> ForecastResponse:
+        """
+        Produce a 12-month price forecast for *part_number* + *tier_1*.
+        Parameters
+        ---------
+        part_number:
+            The part to forecast.
+        tier_1:
+            Supplier name (e.g. "Kadon Aerospace", "NA").
+            Together with part_number forms the unique lookup key.
+        cng_q, cng_q_1:
+            CNG_Q and CNG_Q-1 ($/lb) from the request; used unchanged for
+            every forecast month.
+        include_current_month:
+            False (default) → forecast the next 12 months, starting next month.
+            True            → start at the current month and forecast 13 months
+                              (current month + next 12).
+            P_current for the first step is the price of the month just before
+            the first forecast month: this month's price for False, last
+            month's price for True. The data store must hold prices for that
+            month, otherwise a ValueError explains the mismatch.
+        Returns
+        ------
+        ForecastResponse
+        Raises
+        -----
+        ValueError
+            If the part+tier_1 combination is unknown or price unavailable.
+        """
+        #now_utc = datetime.now(timezone.utc)
+        #current_month = now_utc.strftime("%Y-%m")
+        now_utc = datetime.now(timezone.utc)
+        #current_month = now_utc.strftime("%Y-%m")
+        now_utc = datetime(now_utc.year, 10, 1, tzinfo=timezone.utc)
+        current_month = now_utc.strftime("%Y-%m")
+        # P_current = price of the month just before the first forecast month:
+        #   include_current_month → LAST month's price, forecast starts this month
+        #   otherwise             → THIS month's price, forecast starts next month
+        if include_current_month:
+            price_year, price_month = _prev_month(now_utc.year, now_utc.month)
+            base_year_month = f"{price_year}-{price_month:02d}"
+        else:
+            base_year_month = current_month
+        logger.info(
+            "Starting forecast: part=%s  tier_1=%s  current_month=%s  price_month=%s",
+            part_number, tier_1, current_month, base_year_month,
         )
-
-    pn_col = cols_lower["part number"]
-    t1_col = cols_lower["tier 1"]
-
-    seen: set[tuple[str, str]] = set()
-    rows: list[dict] = []
-    for _, row in df.iterrows():
-        pn = str(row[pn_col]).strip()
-        t1 = str(row[t1_col]).strip()
-        if not (pn and t1) or (pn, t1) in seen:
-            continue
-        try:
-            cng_q   = float(row[cng_q_col])
-            cng_q_1 = float(row[cng_q1_col])
-        except (ValueError, TypeError):
+        # ── Part weight ───────────────────────────────────────────────────
+        pwt = self._parts.get_part_weight(part_number, tier_1)
+        if pwt is None:
             raise ValueError(
-                f"Non-numeric CNG value for part '{pn}' / '{t1}'. "
-                "CNG_Q and CNG_Q-1 must be numbers."
+                f"Part not found: part_number='{part_number}' tier_1='{tier_1}'. "
+                "Check that both values match the data store exactly."
             )
-        seen.add((pn, t1))
-        rows.append({"part_number": pn, "tier_1": t1, "cng_q": cng_q, "cng_q_1": cng_q_1})
-
-    logger.info("Read %d unique (part, tier_1, cng) rows from uploaded file", len(rows))
-    return rows
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT BUILDER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_forecasts_uniform(
-    part_tier_pairs: list[tuple[str, str]],
-    engine: ForecastEngine,
-    cng_q: float,
-    cng_q_1: float,
-    include_current_month: bool,
-) -> dict[tuple[str, str], "ForecastResponse | Exception"]:
-    """Run the engine for every pair using ONE shared CNG_Q / CNG_Q-1."""
-    # ======================================================================
-    # NEW - PPI
-    # calling for ppi forecast
-    # This is the new feature as per thapase/srikanth requirements on 10/21/2026
-    #reset_backup_flag()          # NEW: one backup for this run
-    #logger.info("_run_forecasts_uniform called")
-    
-
-    refresh_ppi_forecast()                          # NEW - PPI: latest predicted PPI before forecasting
-    refresh_lme_forecast()                          # NEW - LME: latest predicted LME price before forecasting
-    refresh_aop_from_input()        # NEW - AOP input -> AOP sheet (+ shared backup) #######
-    # ======================================================================
-    results: dict[tuple[str, str], ForecastResponse | Exception] = {}
-    for pn, t1 in part_tier_pairs:
-        try:
-            results[(pn, t1)] = engine.forecast(
-                part_number=pn, tier_1=t1, cng_q=cng_q, cng_q_1=cng_q_1,
-                include_current_month=include_current_month,
+        # ── Base price — always from data store ───────────────────────────
+        base_price = self._parts.get_base_price(part_number, tier_1, base_year_month)
+        if base_price is None:
+            raise _price_month_error(
+                self._parts, part_number, tier_1, base_year_month, include_current_month
             )
-            logger.debug("Forecast OK: %s / %s", pn, t1)
-        except Exception as exc:
-            results[(pn, t1)] = exc
-            logger.warning("Forecast failed for %s / %s: %s", pn, t1, exc)
-    return results
+        logger.info(
+            "Part=%s  Tier1=%s  PWt=%.2f lbs  P_base=%.4f $/lb",
+            part_number, tier_1, pwt, base_price,
+        )
+        # ── Iterate over 12 future months ─────────────────────────────────
+        base_year, base_month = map(int, base_year_month.split("-"))
+        current_price = base_price
+        forecasts: list[MonthForecast] = []
+        # First forecast month is always the month after the price month.
+        # include_current_month → 13 months (this month + next 12), else 12.
+        forecast_year, forecast_month = _advance_month(base_year, base_month)
+        n_months = self._horizon + 1 if include_current_month else self._horizon
+        # ── MODIFICATION ────────────────────────────────────────
+        # NEW: 50-day implementation lag (2 months) and +/-2% deadband.
+        # Read from settings if defined there, otherwise use these defaults.
+        #price_lag = getattr(settings, "PRICE_LAG_MONTHS", 2)
+        deadband = getattr(settings, "DEADBAND_PCT", 0.02)
+
+        # NEW: price calculated in each step (goes live `price_lag` months later)
+        #calculated_prices: list[float] = []
+
+        # ── NEW MODIFICATION ────────────────────────────────────────
+        active_base = base_price
+        pending_first_month_price: Optional[float] = None
+
+        for step in range(n_months):
+            year_month_key = f"{forecast_year}-{forecast_month:02d}"
+            logger.debug("Step %d: forecasting %s", step + 1, year_month_key)
+            # ── NEW MODIFICATION ────────────────────────────────────────
+            position = _month_position_in_quarter(forecast_month)
+            is_first_month_of_quarter = (position == 1)
+            is_last_month_of_quarter = (position == 3)
+            #   1st or 2nd month of the quarter -> active_base (unchanged all quarter)
+            #   3rd (last) month of the quarter -> this quarter's own 1st month price
+            if is_last_month_of_quarter and pending_first_month_price is not None:
+                current_price = pending_first_month_price
+            else:
+                current_price = active_base
 
 
-def _run_forecasts_per_row(
-    part_rows: list[dict],
-    engine: ForecastEngine,
-    include_current_month: bool,
-) -> tuple[list[tuple[str, str]], dict[tuple[str, str], "ForecastResponse | Exception"]]:
-    """Run the engine per row, each with its OWN CNG_Q / CNG_Q-1 from the file."""
-    results: dict[tuple[str, str], ForecastResponse | Exception] = {}
-    # ======================================================================
-    # NEW - PPI
-    # calling for ppi forecast
-    # This is the new feature as per thapase/srikanth requirements on 10/21/2026
-    refresh_ppi_forecast()                          # NEW - PPI: latest predicted PPI before forecasting
-    refresh_lme_forecast()                          # NEW - LME: latest predicted LME price before forecasting
-    refresh_aop_from_input()        # NEW - AOP input -> AOP sheet (+ shared backup) ######
-    # ======================================================================
-    part_tier_pairs: list[tuple[str, str]] = []
-    for row in part_rows:
-        key = (row["part_number"], row["tier_1"])
-        part_tier_pairs.append(key)
-        try:
-            results[key] = engine.forecast(
-                part_number=key[0], tier_1=key[1],
-                cng_q=row["cng_q"], cng_q_1=row["cng_q_1"],
-                include_current_month=include_current_month,
+            # ── Build context for this month (MC_Q / PPI_Q vary per month) ─
+            try:
+                ctx = _compute_quarter_context(
+                    forecast_year, forecast_month, self._market, self._df_c,
+                    cng_q, cng_q_1, current_month,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Cannot compute quarter context for {year_month_key}: {exc}"
+                ) from exc
+            # ── Core formula ──────────────────────────────────────────────
+            # P_next = P_current + [(AMS_Q - AMS_Q-1) × PWt] + (PPI_Factor × P_current)
+            # ── THIS LINE IS NOT TOUCHED BY THE BREAKDOWN FEATURE ─────────
+            price_adjustment = ctx.ams_delta * pwt
+            ppi_adjustment   = ctx.ppi_factor * current_price
+            raw_price = current_price + price_adjustment + ppi_adjustment
+
+
+            
+            # ── MODIFICATION ────────────────────────────────────────
+            # -- Factor breakdown (only when requested) ------------------------
+            # -- NEW: deadband (final validation step) --
+            # within +/-2% of the base price -> base price is retained
+            # This is the new feature as per thapase/srikanth requirements on 09/30/2026
+            if current_price != 0 and abs(raw_price - current_price) / abs(current_price) <= deadband:
+                predicted_price = current_price
+            else:
+                predicted_price = raw_price
+            logger.debug(
+                "%s: P_current=%.4f  AMS_delta=%.4f  PWt=%.2f  "
+                "price_adj=%.4f  ppi_adj=%.4f  P_predicted=%.4f",
+                year_month_key,
+                current_price,
+                ctx.ams_delta,
+                pwt,
+                price_adjustment,
+                ppi_adjustment,
+                predicted_price,
             )
-            logger.debug("Forecast OK: %s / %s (CNG_Q=%s)", key[0], key[1], row["cng_q"])
-        except Exception as exc:
-            results[key] = exc
-            logger.warning("Forecast failed for %s / %s: %s", key[0], key[1], exc)
-    return part_tier_pairs, results
+                
+             # CHANGED: uses raw_price (before deadband) so sum_check stays 0
+            # Deadband (final validation step)
+            breakdown = (
+                _compute_price_breakdown(
+                    ctx=ctx,
+                    current_price=current_price,
+                    predicted_price=raw_price,
+                    pwt=pwt,
+                    df_c=self._df_c,
+                )
+                if include_breakdown else None
+            )
+            forecasts.append(
+                MonthForecast(
+                    year_month=year_month_key,
+                    month_label=_month_label(year_month_key),
+                    predicted_price=round(predicted_price, 4),
+                    predicted_price_without_deadband=round(raw_price, 4),   # NEW
+                    base_price_used=round(current_price, 4),
+                    pwt=pwt,
+                    df_c=self._df_c,
+                    quarter_context=ctx,
+                    price_change_breakdown=breakdown,
+                    is_data_projected=(step >= 1),
+                )
+            )
 
+            # ── NEW MODIFICATION ────────────────────────────────────────
+            # CHANGED: remember this quarter's 1st-month result for later use at its 3rd month
+            if is_first_month_of_quarter:
+                pending_first_month_price = predicted_price
 
-def build_forecast_workbook(
-    part_tier_pairs: list[tuple[str, str]],
-    engine: ForecastEngine,
-    cng_q: float,
-    cng_q_1: float,
-    include_current_month: bool = False,
-) -> bytes:
-    """
-    Run forecasts for all (part_number, tier_1) pairs with a single shared
-    CNG pair and build the output workbook. Kept for backward compatibility.
-    """
-    results = _run_forecasts_uniform(
-        part_tier_pairs, engine, cng_q, cng_q_1, include_current_month
-    )
-    # ======================================================================
-    # NEW - AOP
-    return _build_workbook_from_results(part_tier_pairs, results, _load_aop_lookup()) # CHANGED - AOP 
-    # ======================================================================
+            # CHANGED: when this was the quarter's last month, the base it just used
+            # becomes the active base going forward (carried into the next quarter's
+            # 1st and 2nd months), and we reset for the next quarter.
+            if is_last_month_of_quarter:
+                active_base = current_price
+                pending_first_month_price = None
 
-
-def build_forecast_workbook_from_rows(
-    part_rows: list[dict],
-    engine: ForecastEngine,
-    include_current_month: bool = False,
-) -> bytes:
-    """Run forecasts using per-row CNG (from the file) and build the workbook."""
-    part_tier_pairs, results = _run_forecasts_per_row(
-        part_rows, engine, include_current_month
-    )
-    # ======================================================================
-    # NEW - AOP
-    return _build_workbook_from_results(part_tier_pairs, results, _load_aop_lookup())   # CHANGED - AOP)
-    # ======================================================================
-
-
-
-def build_preview_from_rows(
-    part_rows: list[dict],
-    engine: ForecastEngine,
-    include_current_month: bool = False,
-) -> dict:
-    """
-    Run forecasts using per-row CNG and return a JSON-serialisable preview
-    (Summary + one entry per monthly sheet) for on-screen display.
-    """
-    part_tier_pairs, results = _run_forecasts_per_row(
-        part_rows, engine, include_current_month
-    )
-
-    aop_lookup = _load_aop_lookup()   # NEW - AOP, same source the Excel workbook uses
-
-    month_labels: list[tuple[str, str]] = []
-    for r in results.values():
-        if isinstance(r, ForecastResponse):
-            month_labels = [(f.year_month, f.month_label) for f in r.forecasts]
-            break
-    if not month_labels:
-        first_error = next(iter(results.values()), None)
-        raise ValueError(
-            f"All parts failed forecasting — nothing to preview. First error: {first_error}"
+            forecast_year, forecast_month = _advance_month(forecast_year, forecast_month)
+        logger.info(
+            "Forecast complete for part=%s: %d months, "
+            "range %s -> %s, price %.4f -> %.4f",
+            part_number,
+            len(forecasts),
+            forecasts[0].year_month,
+            forecasts[-1].year_month,
+            forecasts[0].predicted_price,
+            forecasts[-1].predicted_price,
+        )
+        return ForecastResponse(
+            part_number=part_number,
+            tier_1=tier_1,
+            pwt_lbs=pwt,
+            base_year_month=base_year_month,
+            base_price=base_price,
+            forecast_generated_at=now_utc.isoformat(),
+            forecasts=forecasts,
         )
 
-    n_ok = sum(1 for r in results.values() if isinstance(r, ForecastResponse))
-    n_failed = len(results) - n_ok
+    # ======================================================================
+    # NEW - AOP (Annual Operating Plan) helpers.
+    # This is the new feature as per thapase/srikanth requirements on 10/20/2026
+    # ------------------------------------------------------------------ 
+    def apply_aop( 
+        self, 
+        response: "ForecastResponse", 
+        aop_lookup: dict[tuple[str, str, str], float], 
+    ) -> dict[str, tuple[Optional[float], Optional[float]]]: 
+        """ 
+        Total AOP for one part, month by month. 
+        Returns {year_month: (aop_qty, total_aop_value)}. 
+        Uses MonthForecast.predicted_price (final price after deadband = Excel col S). 
+        To use the raw price (col R) use m.predicted_price_without_deadband instead. 
+        """ 
+        part = _aop_part_key(response.part_number) 
+        tier = _aop_part_key(response.tier_1) 
+        result: dict[str, tuple[Optional[float], Optional[float]]] = {} 
+        for m in response.forecasts: 
+            qty = aop_lookup.get((part, tier, m.year_month)) 
+            result[m.year_month] = (qty, compute_total_aop(m.predicted_price, qty)) 
+        return result
+    # ======================================================================
 
-    summary: list[dict] = []
-    for pn, t1 in part_tier_pairs:
-        r = results[(pn, t1)]
-        if isinstance(r, Exception):
-            summary.append({"part_number": pn, "tier_1": t1, "error": str(r)})
-            continue
-        monthly = []
-        for ym, _ in month_labels:
-            mf = next((f for f in r.forecasts if f.year_month == ym), None)
-            monthly.append(mf.predicted_price if mf else None)
-        ctx0 = r.forecasts[0].quarter_context
-        summary.append({
-            "part_number": pn, "tier_1": t1,
-            "weight_lbs": r.pwt_lbs, "base_price": r.base_price,
-            "cng_q": ctx0.cng_q, "cng_q_1": ctx0.cng_q_1,
-            "monthly": monthly, "error": None,
-        })
-
-    # ── MODIFICATION ────────────────────────────────────────
-    # ── Base Price Summary (on-screen) ─────────────────────────────────
-    # Mirrors the "Base Price Summary" Excel sheet: base price used (P_current) per month
-    base_price_summary: list[dict] = []
-    for pn, t1 in part_tier_pairs:
-        r = results[(pn, t1)]
-        if isinstance(r, Exception):
-            base_price_summary.append({"part_number": pn, "tier_1": t1, "error": str(r)})
-            continue
-        monthly_base = []
-        for ym, _ in month_labels:
-            mf = next((f for f in r.forecasts if f.year_month == ym), None)
-            monthly_base.append(round(mf.base_price_used, 2) if mf else None)
-        base_price_summary.append({
-            "part_number": pn, "tier_1": t1,
-            "weight_lbs": r.pwt_lbs,
-            "monthly": monthly_base,          # same order as "months"
-            "error": None,
-        })
-
-
-    monthly_sheets: list[dict] = []
-    
-    # ── Total AOP Summary (on-screen) ───────────────────────────────────
-    # Mirrors the "Total AOP Summary" Excel sheet: Total AOP ($) per part per month
-    aop_summary: list[dict] = []
-    aop_input: list[dict] = [] ##Sandeep
-    
-    aop_grand_total = 0.0
-    aopinput_grand_total = 0.0 ##Sandeep
-    if aop_lookup:
-        for pn, t1 in part_tier_pairs:
-            r = results[(pn, t1)]
-            if isinstance(r, Exception):
-                aop_summary.append({"part_number": pn, "tier_1": t1, "error": str(r)})
-                aop_input.append({"part_number": pn, "tier_1": t1, "error": str(r)}) ##sandeep
-                continue
-            _pn, _t1 = pn.strip().lower(), t1.strip().lower()
-            monthly_aop = []
-            monthly_aopinput = [] ##Sandeep
-                        
-            part_total = 0.0
-            parttotal_AOPInput = 0.0
-            has_value = False
-            for ym, _ in month_labels:
-                mf = next((f for f in r.forecasts if f.year_month == ym), None)
-                month_total = None
-                month_total_AOPInput = None ##Sandeep
-                if mf is not None:
-                    aop_qty = aop_lookup.get((_pn, _t1, ym))
-                    if aop_qty is None:
-                        aop_qty = aop_lookup.get((_pn, "", ym))
-                    #month_total = compute_total_aop(mf.predicted_price, aop_qty)  
-                    month_total = compute_total_aop(round(mf.base_price_used, 2), aop_qty)  ######
-                    month_total_AOPInput =  aop_qty                 
-                    if month_total is not None:
-                        part_total += month_total
-                        parttotal_AOPInput += month_total_AOPInput ##Sandeep
-                        has_value = True
-                monthly_aop.append(round(month_total, 2) if month_total is not None else None)
-                monthly_aopinput.append(round(month_total_AOPInput, 2) if month_total_AOPInput is not None else None) ##Sandeep
-            if has_value:
-                aop_grand_total += part_total
-                aopinput_grand_total += parttotal_AOPInput
-            aop_summary.append({
-                "part_number": pn, "tier_1": t1,
-                "monthly": monthly_aop,
-                "total_all_months": round(part_total, 2) if has_value else None,
-                "error": None,
-            })
-            aop_input.append({
-                "part_number": pn, 
-                "monthly": monthly_aopinput,   
-                "total_all_months": round(parttotal_AOPInput, 2) if has_value else None,                            
-                "error": None,
-            })
-
-    for ym, label in month_labels:
-        rows: list[dict] = []
-        for pn, t1 in part_tier_pairs:
-            r = results[(pn, t1)]
-            if isinstance(r, Exception):
-                rows.append({"part_number": pn, "tier_1": t1, "error": str(r)})
-                continue
-            mf = next((f for f in r.forecasts if f.year_month == ym), None)
-            if mf is None:
-                rows.append({"part_number": pn, "tier_1": t1, "error": f"No data for {ym}"})
-                continue
-            q = mf.quarter_context
-            total_aop = None
-            if aop_lookup:
-                _pn, _t1 = pn.strip().lower(), t1.strip().lower()
-                aop_qty = aop_lookup.get((_pn, _t1, ym))
-                if aop_qty is None:
-                    aop_qty = aop_lookup.get((_pn, "", ym))
-                #total_aop = compute_total_aop(mf.predicted_price, aop_qty)
-                total_aop = compute_total_aop(round(mf.base_price_used, 2), aop_qty)  #########
-            rows.append({
-                "part_number": pn, "tier_1": t1,
-                "weight_lbs": r.pwt_lbs, "base_price_used": mf.base_price_used,
-                "quarter": q.quarter_label,
-                "mc_q": q.mc_q, "mc_q_1": q.mc_q_1,
-                "ppi_q": q.ppi_q, "ppi_q_1": q.ppi_q_1, "ppi_factor": q.ppi_factor,
-                "cng_q": q.cng_q, "cng_q_1": q.cng_q_1,
-                "ams_q": q.ams_q, "ams_q_1": q.ams_q_1, "ams_delta": q.ams_delta,
-                "predicted_price": mf.predicted_price, 
-                # ── MODIFICATION ──────────────────────────────────────── 
-                "predicted_price_without_deadband": mf.predicted_price_without_deadband,   #
-                "total_aop": round(total_aop, 2) if total_aop is not None else None,   # NEW - AOP
-                # ─────────────────────────────────────────────────────────                
-                "error": None,
-
-            })
-        monthly_sheets.append({"year_month": ym, "label": label, "rows": rows})   
-
-
-    
-
-    return {
-        "part_count": len(part_tier_pairs),
-        "ok": n_ok,
-        "failed": n_failed,
-        "months": [{"year_month": ym, "month_label": label} for ym, label in month_labels],
-        "summary": summary,
-        # ── MODIFICATION ──────────────────────────────────────── 
-        "base_price_summary": base_price_summary,      #
-        # ─────────────────────────────────────────────────────────
-        "aop_summary": aop_summary,                 # NEW - AOP
-        "aop_grand_total": round(aop_grand_total, 2) if aop_lookup else None,  # NEW - AOP
-        "monthly_sheets": monthly_sheets,
-        "aop_input":aop_input, ##Sandeep
-        "aopinput_grand_total":round(aopinput_grand_total, 2) if aop_lookup else None,  ##Sandeep
-    }
-
-
-def _build_workbook_from_results(
-    part_tier_pairs: list[tuple[str, str]],
-    results: dict[tuple[str, str], "ForecastResponse | Exception"],
-    aop_lookup: Optional[dict] = None,     # NEW - AOP (new optional parameter,
-) -> bytes:
-    """
-    Build the formatted .xlsx workbook from already-computed results.
-
-    include_current_month affects the number of monthly sheets via the
-    supplied results. Failed rows show an ERROR message instead of stopping
-    the batch. Returns raw bytes of the generated .xlsx workbook.
-    """
-    # ── Step 2: determine month labels from first successful result ───────
-    month_labels: list[tuple[str, str]] = []
-    for r in results.values():
-        if isinstance(r, ForecastResponse):
-            month_labels = [(f.year_month, f.month_label) for f in r.forecasts]
-            break
-
-    if not month_labels:
-        first_error = next(iter(results.values()), None)
-        raise ValueError(
-            "All parts failed forecasting — cannot generate output workbook. "
-            f"First error: {first_error}"
-        )
-
-    # ── Step 3: build workbook ────────────────────────────────────────────
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-
-    for year_month, month_label in month_labels:
-        ws = wb.create_sheet(title=month_label[:31])
-        ws.freeze_panes = "A2"
-
-        for ci, (label, _, _) in enumerate(COLUMNS, 1):
-            _write_header(ws, ci, label)
-
-        # ======================================================================
-        # NEW - AOP
-        # To save in Excel File
-        if aop_lookup:  # NEW - AOP (a) header
-            _write_header(ws, N_COLS + 1, "Total AOP\n($)")
-        # ======================================================================
-
-
-        for ri, (pn, t1) in enumerate(part_tier_pairs, 2):
-            fill   = _ALT_FILL if ri % 2 == 0 else _WHITE_FILL
-            result = results[(pn, t1)]
-
-
-
-            if isinstance(result, Exception):
-                _write_error_row(ws, ri, pn, t1, str(result), fill)
-                continue
-
-            mf = next((f for f in result.forecasts if f.year_month == year_month), None)
-            if mf is None:
-                _write_error_row(ws, ri, pn, t1, f"No forecast data for {year_month}", fill)
-                continue
-
-            for ci, (_, fmt, extractor) in enumerate(COLUMNS, 1):
-                left = ci in (1, 2)
-                try:
-                    value = extractor(pn, t1, result, mf)
-                except Exception as ex:
-                    value = f"ERR: {ex}"
-                _write_data(ws, ri, ci, value, fmt, fill, left=left)
-
-            # ======================================================================
-            # NEW - AOP
-            # To Save in Excel File
-            # This is the new feature as per thapase/srikanth requirements on 10/20/2026
-            if aop_lookup:                                   # NEW - AOP (b) value 
-                #aop_qty = aop_lookup.get((pn, year_month))
-                # NEW
-                _pn, _t1 = pn.strip().lower(), t1.strip().lower()
-                aop_qty = aop_lookup.get((_pn, _t1, year_month))      # tier-specific AOP first
-                if aop_qty is None:
-                    aop_qty = aop_lookup.get((_pn, '', year_month))   # else item-level AOP (no tier)
-                #_write_data(ws, ri, N_COLS + 1,
-                #            compute_total_aop(mf.predicted_price, aop_qty),
-                #            "$#,##0.00", fill)
-                # NEW-AOP(qty*base_price_summary_sheet)
-                # This is modified as per the thapase requirement on 10/26/2026
-                _write_data(ws, ri, N_COLS + 1, 
-                            compute_total_aop(round(mf.base_price_used, 2), aop_qty), 
-                            "$#,##0.00", fill)
-            # ======================================================================   
-
-        _set_col_widths(ws)
-
-        # ======================================================================
-        # NEW - AOP
-        if aop_lookup:                        
-            ws.column_dimensions[get_column_letter(N_COLS + 1)].width = 18
-        # ======================================================================
-
-
-    # ── Step 4: summary sheet ─────────────────────────────────────────────
-    _build_summary_sheet(wb, part_tier_pairs, results, month_labels)
-
-
-    # ── MODIFICATION ────────────────────────────────────────
-    # This creates a new sheet "Base Price Summary" that shows the base price used for each month
-    # This is the new feature as per thapase/srikanth requirements on 09/30/2026
-    _build_base_price_summary_sheet(wb, part_tier_pairs, results, month_labels)
-
-    # NEW - AOP 
-    # sheet "Total AOP Summary" (part x month)
-    # This is the new feature as per thapase/srikanth requirements on 10/22/2026
-    if aop_lookup:
-        _build_total_aop_summary_sheet(wb, part_tier_pairs, results, month_labels, aop_lookup)
-
-    # ── Step 5: serialise ─────────────────────────────────────────────────
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-def _build_summary_sheet(
-    wb, part_tier_pairs, results, month_labels
-) -> None:
-    ws = wb.create_sheet(title="Summary", index=0)
-    ws.freeze_panes = "E2"
-
-    fixed   = ["Part Number", "Tier 1", "Weight (lbs)", "Base Price ($)"]
-    monthly = [label for _, label in month_labels]
-
-    for ci, h in enumerate(fixed + monthly, 1):
-        _write_header(ws, ci, h)
-    ws.row_dimensions[1].height = 36
-
-    for ri, (pn, t1) in enumerate(part_tier_pairs, 2):
-        fill   = _ALT_FILL if ri % 2 == 0 else _WHITE_FILL
-        result = results[(pn, t1)]
-
-        if isinstance(result, Exception):
-            _write_error_row(ws, ri, pn, t1, str(result), fill)
-            continue
-
-        _write_data(ws, ri, 1, pn,               "@",            fill, left=True)
-        _write_data(ws, ri, 2, t1,               "@",            fill, left=True)
-        _write_data(ws, ri, 3, result.pwt_lbs,   "0.00",         fill)
-        _write_data(ws, ri, 4, round(result.base_price, 2), "$#,##0.00", fill) # # change to "$#,##0.00" and result.base_price to round(result.base_price,2)
-
-        for mi, (year_month, _) in enumerate(month_labels):
-            mf  = next((f for f in result.forecasts if f.year_month == year_month), None)
-            val = round(mf.predicted_price, 2) if mf else "N/A"   ##### mf.predicted_price to round(mf.predicted_price, 2)
-            _write_data(ws, ri, 5 + mi, val, "$#,##0.00", fill)
-
-    # Column widths
-    for col, width in zip("ABCD", [22, 22, 12, 16]):
-        ws.column_dimensions[col].width = width
-    for i in range(len(month_labels)):
-        ws.column_dimensions[get_column_letter(5 + i)].width = 18
-
-
-
-# ── MODIFICATION ────────────────────────────────────────
-# This creates a new sheet "Base Price Summary" that shows the base price used for each month
-# This is the new feature as per thapase/srikanth requirements on 09/30/2026
-def _build_base_price_summary_sheet(
-    wb, part_tier_pairs, results, month_labels
-) -> None:
-    ws = wb.create_sheet(title="Base Price Summary", index=1)   # right after Summary (index=0)
-    ws.freeze_panes = "D2"                                       # was E2, shifted by 1
-
-    fixed   = ["Part Number", "Tier 1", "Weight (lbs)"]           # "Base Price ($)" removed
-    monthly = [label for _, label in month_labels]
-
-    for ci, h in enumerate(fixed + monthly, 1):
-        _write_header(ws, ci, h)
-    ws.row_dimensions[1].height = 36
-
-    for ri, (pn, t1) in enumerate(part_tier_pairs, 2):
-        fill   = _ALT_FILL if ri % 2 == 0 else _WHITE_FILL
-        result = results[(pn, t1)]
-
-        if isinstance(result, Exception):
-            _write_error_row(ws, ri, pn, t1, str(result), fill)
-            continue
-
-        _write_data(ws, ri, 1, pn,             "@",    fill, left=True)
-        _write_data(ws, ri, 2, t1,             "@",    fill, left=True)
-        _write_data(ws, ri, 3, result.pwt_lbs, "0.00", fill)
-        # Base Price ($) column removed — month columns now start at 4
-
-        for mi, (year_month, _) in enumerate(month_labels):
-            mf  = next((f for f in result.forecasts if f.year_month == year_month), None)
-            val = round(mf.base_price_used, 2) if mf else "N/A" ### mf.base_price_used to round(mf.base_price_used, 2)
-            _write_data(ws, ri, 4 + mi, val, "$#,##0.00", fill)   # was 5 + mi ## change to "$#,##0.00"
-
-    for col, width in zip("ABC", [22, 22, 12]):                     # was "ABCD", 4 widths
-        ws.column_dimensions[col].width = width
-    for i in range(len(month_labels)):
-        ws.column_dimensions[get_column_letter(4 + i)].width = 18   # was 5 + i
-
-
-# ======================================================================
-# NEW - AOP
-# Creates the sheet "Total AOP Summary": one row per (Part Number, Tier 1), one column
-# per forecast month. Each month column shows THAT month's own Total AOP ($)
-# (AOP qty x predicted price = same value as column T of the month tab) - NOT cumulative.
-# The LAST column "Total AOP (All Months)" = sum of all months of that part.
-# The "Grand Total" row at the bottom adds up ONLY the "Total AOP (All Months)" column.
-# This is the new feature as per thapase/srikanth requirements on 10/22/2026
-def _build_total_aop_summary_sheet(
-    wb, part_tier_pairs, results, month_labels, aop_lookup
-) -> None:
-    ws = wb.create_sheet(title="Model Driven AOP", index=2)   # right after Summary and Base Price Summary
-    ws.freeze_panes = "C2"                                      # Part Number and Tier 1 stay visible
- 
-    n_months = len(month_labels)
-    fixed    = ["Part Number", "Tier 1"]
-    monthly  = [label for _, label in month_labels]
-    last_col = 3 + n_months                                     # column of "Total AOP (All Months)"
- 
-    for ci, h in enumerate(fixed + monthly + ["Total AOP\n(All Months)"], 1):
-        _write_header(ws, ci, h)
-    ws.row_dimensions[1].height = 36
- 
-    grand_total = 0.0                        # Grand Total of the "Total AOP (All Months)" column
- 
-    for ri, (pn, t1) in enumerate(part_tier_pairs, 2):
-        fill   = _ALT_FILL if ri % 2 == 0 else _WHITE_FILL
-        result = results[(pn, t1)]
- 
-        if isinstance(result, Exception):
-            _write_error_row(ws, ri, pn, t1, str(result), fill)
-            continue
- 
-        _write_data(ws, ri, 1, pn, "@", fill, left=True)
-        _write_data(ws, ri, 2, t1, "@", fill, left=True)
- 
-        _pn, _t1 = pn.strip().lower(), t1.strip().lower()
-        part_total = 0.0       # sum of all months of this part
-        has_value = False      # stays False if no month has an AOP qty (total cell stays blank)
-        for mi, (year_month, _) in enumerate(month_labels):
-            month_total = None
-            mf = next((f for f in result.forecasts if f.year_month == year_month), None)
-            if mf is not None:
-                aop_qty = aop_lookup.get((_pn, _t1, year_month))          # tier-specific AOP first
-                if aop_qty is None:
-                    aop_qty = aop_lookup.get((_pn, "", year_month))       # else item-level AOP (no tier)
-                #month_total = compute_total_aop(mf.predicted_price, aop_qty)   # None if no qty
-                # NEW - AOP (qty*base_price_summary_sheet)
-                # This is modified as per the thapase requirement on 10/26/2026
-                month_total = compute_total_aop(round(mf.base_price_used, 2), aop_qty)   # None if no qty
-                if month_total is not None:
-                    part_total += month_total
-                    has_value = True
-            # this month's own Total AOP (blank if the month has no AOP qty)
-            _write_data(ws, ri, 3 + mi, round(month_total, 2) if month_total is not None else None,
-                        "$#,##0.00", fill)
- 
-        # last column: sum of all months for this part
-        _write_data(ws, ri, last_col, round(part_total, 2) if has_value else None, "$#,##0.00", fill)
-        if has_value:
-            grand_total += part_total
- 
-    # Grand Total row - bold, below the last part row (only the "Total AOP (All Months)" column)
-    tr = len(part_tier_pairs) + 2
-    tfill = PatternFill("solid", fgColor="FFE699")
-    _write_data(ws, tr, 1, "Grand Total", "@", tfill, left=True)
-    _write_data(ws, tr, 2, "", "@", tfill, left=True)
-    for mi in range(n_months):                      # month columns: no grand total
-        _write_data(ws, tr, 3 + mi, None, "$#,##0.00", tfill)
-    _write_data(ws, tr, last_col, round(grand_total, 2), "$#,##0.00", tfill)   # only the last column
-    for ci in range(1, last_col + 1):
-        ws.cell(row=tr, column=ci).font = Font(name="Arial", size=10, bold=True)
- 
-    for col, width in zip("AB", [22, 22]):
-        ws.column_dimensions[col].width = width
-    for i in range(n_months):
-        ws.column_dimensions[get_column_letter(3 + i)].width = 18
-    ws.column_dimensions[get_column_letter(last_col)].width = 20
-# ======================================================================
