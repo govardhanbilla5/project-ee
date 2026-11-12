@@ -1,0 +1,856 @@
+"""
+Excel-backed market data + part master repository.
+
+Reads aluminium_data.xlsx (4 sheets: Parts, LME, Midwest, PPI).
+CNG values are not read from Excel — they come from the request body.
+
+PARTS SHEET CONTRACT
+────────────────────
+Columns (by position):
+  0 : Part Number
+  1 : Tier 1          ← supplier name (e.g. "Kadon Aerospace", "NA")
+  2 : Weight (lbs)
+  3 : Current Price ($)  ← header MUST name the month the prices are for,
+                           e.g. "Current Price ($) Aug 2026" (also accepts
+                           "August 2026", "2026-08", "08/2026")
+
+The unique key for every part lookup is (Part Number, Tier 1).
+
+SWAP INSTRUCTIONS
+─────────────────
+Implement MarketDataRepository / PartRepository from app/data/base.py
+and update DI in app/api/v1/endpoints/forecast_excel.py.
+"""
+
+import calendar
+import logging
+import os
+import re
+from functools import lru_cache
+from typing import Optional
+import datetime
+import math
+
+
+import pandas as pd
+
+from app.data.base import MarketDataRepository, PartRepository
+
+logger = logging.getLogger(__name__)
+
+#_DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "aluminium_data.xlsx")
+#EXCEL_FILE_PATH: str = os.environ.get("ALUMINIUM_EXCEL_PATH", _DEFAULT_PATH)
+
+
+from pathlib import Path
+import sys
+ 
+if getattr(sys, "frozen", False):
+    ROOT_DIR = Path(sys.executable).parent
+else:
+    ROOT_DIR = Path(__file__).resolve().parents[3]
+ 
+EXCEL_FILE_PATH = ROOT_DIR / "aluminium_data.xlsx"
+
+# =============================================================================
+from openpyxl.cell.cell import MergedCell
+# NEW - Midwest
+# future values of 'midwest_input' ($/MT) -> $/lb -> 'Midwest' sheet
+# Called once from _load_workbook_data() just before the workbook is read, so the engine
+# always reads the values from the 'Midwest' sheet. Nothing else is changed.
+MIDWEST_INPUT_SHEET = "midwest_input"      # sheet the user fills: Month | Future ($/MT) | Past ($/lb)
+MIDWEST_SHEET = "Midwest"                  # sheet the forecast engine reads ($/lb)
+MIDWEST_FUTURE_DIVISOR = 2204.6226         # $/MT -> $/lb (same constant as LME)
+MIDWEST_DECIMALS = 6
+
+
+def _sync_midwest_from_input(path: str) -> int:
+    """
+    Reads 'midwest_input': the FUTURE column ($/MT) is divided by 2204.6226 ($/lb), the PAST column
+    ($/lb) is copied as it is. Both are written into the 'Midwest' sheet (col A = month, col B = value):
+    a month that matches is overwritten, a month that is not there is added at the end.
+    Saves only if something changed.
+    Never raises (a problem is logged and the workbook is read as it is). Returns the number of months written.
+    """
+    try:
+        from copy import copy
+        from datetime import datetime
+        from openpyxl import load_workbook
+
+        def _month(value):
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return None
+            if hasattr(value, "strftime"):
+                return value.strftime("%Y-%m")
+            return _parse_aop_month(str(value).strip())
+
+        def _num(value):
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return None
+            try:
+                return float(str(value).replace(",", "").strip())
+            except ValueError:
+                return None
+
+        try:
+            df = pd.read_excel(path, sheet_name=MIDWEST_INPUT_SHEET, engine="openpyxl",
+                               dtype=str, keep_default_na=False, na_values=[""])
+        except ValueError:                                   # no 'midwest_input' sheet -> old behaviour
+            return 0
+        if df.shape[1] < 2:
+            return 0
+        cols = list(df.columns)
+        past_col = next((c for c in cols[1:] if "past" in str(c).lower()), None)
+        future_col = next((c for c in cols[1:] if "future" in str(c).lower()), None)
+        if future_col is None:                               # no 'future' word: the column that is not 'past'
+            future_col = next((c for c in cols[1:] if c != past_col), None)
+        if future_col is None:
+            return 0
+        values = {}
+        for _, row in df.iterrows():
+            ym = _month(row[cols[0]])
+            if not ym:
+                continue
+            past = _num(row[past_col]) if past_col is not None else None
+            future = _num(row[future_col])
+            if past is not None:
+                values[ym] = (past, 0.0)                                                  # $/lb, copied as it is
+            if future is not None:                                                        # $/MT -> $/lb (wins if both are filled)
+                values[ym] = (round(future / MIDWEST_FUTURE_DIVISOR, MIDWEST_DECIMALS),
+                              0.5 * 10 ** (-MIDWEST_DECIMALS))
+        if not values:
+            return 0
+
+        mtime = os.path.getmtime(path)
+        wb = load_workbook(path)
+        name = next((n for n in wb.sheetnames if n.strip().lower() == MIDWEST_SHEET.lower()), None)
+        if name is None:
+            return 0
+        ws = wb[name]
+        row_of, last_row = {}, 1
+        for r in range(2, ws.max_row + 1):
+            ym = _month(ws.cell(row=r, column=1).value)
+            if ym:
+                row_of[ym], last_row = r, r
+        month_is_date = hasattr(ws.cell(row=last_row, column=1).value, "strftime")
+
+        changed = 0
+        for ym in sorted(values):
+            new, tolerance = values[ym]
+            if ym in row_of:
+                cell = ws.cell(row=row_of[ym], column=2)
+                old = _num(cell.value)
+                if old is not None and abs(old - new) <= tolerance:
+                    continue                                 # already the same value
+                cell.value = new
+            else:
+                last_row += 1
+                for col in (1, 2):                           # same look as the row above
+                    src, dst = ws.cell(row=last_row - 1, column=col), ws.cell(row=last_row, column=col)
+                    if src.has_style:
+                        dst.font, dst.fill, dst.border = copy(src.font), copy(src.fill), copy(src.border)
+                        dst.alignment, dst.number_format = copy(src.alignment), src.number_format
+                ws.cell(row=last_row, column=1).value = (
+                    datetime(int(ym[:4]), int(ym[5:7]), 1) if month_is_date else ym)
+                ws.cell(row=last_row, column=2).value = new
+            changed += 1
+        if not changed:
+            return 0
+        if os.path.getmtime(path) != mtime:                  # file changed meanwhile -> do not overwrite it
+            logger.warning("Midwest: workbook changed while reading - not written this time")
+            return 0
+        wb.save(path)
+        logger.info("Midwest sheet updated from '%s' ($/MT -> $/lb): %d month(s)", MIDWEST_INPUT_SHEET, changed)
+        return changed
+    except Exception:
+        logger.exception("Midwest: could not update the 'Midwest' sheet from '%s' - workbook read as it is",
+                         MIDWEST_INPUT_SHEET)
+        return 0
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHED LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _load_workbook_data(path: str) -> dict[str, pd.DataFrame]:
+    logger.info("Loading Excel data from: %s", path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Excel data file not found at '{path}'. "
+            "Set ALUMINIUM_EXCEL_PATH environment variable to the correct path."
+        )
+    # =============================================================================
+    # NEW - Midwest
+    _sync_midwest_from_input(path)                   # NEW - Midwest: future $/MT -> $/lb into the Midwest sheet
+    # =============================================================================
+    # Unit_Price_DashBoard is optional (only used by the dashboard endpoint);
+    # read it if present, but don't fail the core sheets if it's missing.
+    core = ["Parts", "LME", "Midwest", "PPI","lme_input","ppi_input"]
+    optional = ["Unit_Price_DashBoard","lme_backtest","ppi_backtest"]
+    available = pd.ExcelFile(path, engine="openpyxl").sheet_names
+    wanted = core + [s for s in optional if s in available]
+
+    sheets = pd.read_excel(
+        path,
+        sheet_name=wanted,
+        engine="openpyxl",
+        dtype=str,          # read everything as str first; we cast per column
+        keep_default_na=False,  # prevent 'NA', 'N/A' etc. from becoming NaN
+        na_values=[""],         # only treat blank cells as NaN
+    )
+    logger.info("Excel workbook loaded (%d sheets)", len(sheets))
+    return sheets
+
+
+def _invalidate_cache() -> None:
+    _load_workbook_data.cache_clear()
+    logger.info("Excel data cache cleared")
+
+
+def _get_sheets() -> dict[str, pd.DataFrame]:
+    return _load_workbook_data(EXCEL_FILE_PATH)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKET DATA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _month_lookup(sheet_name: str) -> dict[str, float]:
+    """Return {YYYY-MM: float} from a 2-column market sheet."""
+    df = _get_sheets()[sheet_name]
+    month_col = df.columns[0]
+    value_col = df.columns[1]
+    result: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            result[key] = float(row[value_col])
+        except (ValueError, TypeError):
+            logger.warning("Non-numeric value in %s for month %s", sheet_name, key)
+    return result
+
+def _midwest_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("Midwest")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result_Midwest: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result_Midwest[key] = value
+    return result_Midwest
+
+def _ppi_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("PPI")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result_ppi: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result_ppi[key] = value
+    return result_ppi
+
+def _lme_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("LME")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result_lme: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result_lme[key] = value
+    return result_lme
+
+def _lmebacktest_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("lme_backtest")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result_lmebacktest: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result_lmebacktest[key] = value
+    return result_lmebacktest
+
+def _ppibacktest_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("ppi_backtest")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result_lmebacktest: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result_lmebacktest[key] = value
+    return result_lmebacktest
+
+def _lmeinput_col_lookup(col_prefix: str) -> dict[str, float]:
+    # 1. Fetch the data dictionary
+    sheets_dict = _get_sheets()
+    
+    if sheets_dict is None:
+        #logger.error("_get_sheets() returned None! Check your file loading logic.")
+        return {}
+        
+    # 2. Safely extract the specific sheet
+    df = sheets_dict.get("lme_input")
+    
+    # 3. CRITICAL BIAS CHECK: Ensure it's not None or empty BEFORE running logic
+    if df is None:
+        #logger.warning("Sheet 'lme_input' was not found in the excel data. Available sheets: " + str(list(sheets_dict.keys())))
+        return {}
+    if df.empty:
+        #logger.warning("Sheet 'lme_input' is completely empty.")
+        return {}
+
+    # Standardize ALL column names right away to eliminate casing/spacing bugs
+    df.columns = [str(c).strip() for c in df.columns]
+    month_col = df.columns[0]
+    
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if c.lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        logger.warning(f"Could not find a column starting with prefix: '{col_prefix}' in columns: {list(df.columns)}")
+        return {}
+
+    result_lmeinput: dict[str, float] = {}
+    
+    for _, row in df.iterrows():
+        raw_month = row[month_col]
+        
+        if pd.isna(raw_month):
+            continue
+            
+        if isinstance(raw_month, (pd.Timestamp, datetime.date)):
+            key = raw_month.strftime('%Y-%m')
+        else:
+            key = str(raw_month).strip()[:7]
+
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  
+            
+        if not math.isnan(value):
+            result_lmeinput[key] = value
+
+    logger.info(f"Successfully processed {len(result_lmeinput)} values.")        
+    return result_lmeinput
+
+
+def _ppiinput_col_lookup(col_prefix: str) -> dict[str, float]:
+    # 1. Fetch the data dictionary
+    sheets_dict = _get_sheets()
+    
+    if sheets_dict is None:
+        #logger.error("_get_sheets() returned None! Check your file loading logic.")
+        return {}
+        
+    # 2. Safely extract the specific sheet
+    df = sheets_dict.get("ppi_input")
+    
+    # 3. CRITICAL BIAS CHECK: Ensure it's not None or empty BEFORE running logic
+    if df is None:
+        #logger.warning("Sheet 'lme_input' was not found in the excel data. Available sheets: " + str(list(sheets_dict.keys())))
+        return {}
+    if df.empty:
+        #logger.warning("Sheet 'lme_input' is completely empty.")
+        return {}
+
+    # Standardize ALL column names right away to eliminate casing/spacing bugs
+    df.columns = [str(c).strip() for c in df.columns]
+    month_col = df.columns[0]
+    
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if c.lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        logger.warning(f"Could not find a column starting with prefix: '{col_prefix}' in columns: {list(df.columns)}")
+        return {}
+
+    result_ppiinput: dict[str, float] = {}
+    
+    for _, row in df.iterrows():
+        raw_month = row[month_col]
+        
+        if pd.isna(raw_month):
+            continue
+            
+        if isinstance(raw_month, (pd.Timestamp, datetime.date)):
+            key = raw_month.strftime('%Y-%m')
+        else:
+            key = str(raw_month).strip()[:7]
+
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  
+            
+        if not math.isnan(value):
+            result_ppiinput[key] = value
+
+    logger.info(f"Successfully processed {len(result_ppiinput)} values.")        
+    return result_ppiinput
+
+
+def _dashboard_col_lookup(col_prefix: str) -> dict[str, float]:
+    """
+    Return {YYYY-MM: float} from the optional 'Unit_Price_DashBoard' sheet,
+    reading the first column whose header starts with ``col_prefix`` (case- and
+    space-insensitive), keyed by the sheet's first (month) column.
+
+    Only months with a numeric value are returned — the sheet leaves future
+    months blank for actuals, and those are skipped. Returns an empty dict if
+    the sheet or the column is absent.
+    """
+    import math
+
+    df = _get_sheets().get("Unit_Price_DashBoard")
+    if df is None or df.empty:
+        return {}
+
+    month_col = df.columns[0]
+    prefix = col_prefix.strip().lower()
+    value_col = next(
+        (c for c in df.columns if str(c).strip().lower().startswith(prefix)),
+        None,
+    )
+    if value_col is None:
+        return {}
+
+    result: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = str(row[month_col]).strip()
+        try:
+            value = float(row[value_col])
+        except (ValueError, TypeError):
+            continue  # blank / non-numeric month
+        if not math.isnan(value):
+            result[key] = value
+    return result
+
+
+def dashboard_predicted_lookup() -> dict[str, float]:
+    """{YYYY-MM: predicted unit price} from the 'Predicted_Unit price($/lb)' column."""
+    return _dashboard_col_lookup("predicted")
+
+def lme_predicted_lookup() -> dict[str, float]:
+    """{YYYY-MM: predicted unit price} from the 'LME Price ($/lb)' column."""
+    return _lme_col_lookup("LME Price ($/lb)")
+
+def midwest_premium_lookup() -> dict[str, float]:
+    """{YYYY-MM: Midwest Premium ($/lb) price} from the 'Midwest Premium ($/lb)' column."""
+    return _midwest_col_lookup("Midwest Premium ($/lb)")
+
+def dashboard_actuals_lookup() -> dict[str, float]:
+    """{YYYY-MM: actual adjusted unit price} from the 'Actuals Adjusted($/lb)' column."""
+    #print(f"dashboardDataforActual: {_dashboard_col_lookup("Actuals Adjusted($/lb)")}")
+    return _dashboard_col_lookup("Actuals Adjusted($/lb)")
+
+def lmeinput_actuals_lookup() -> dict[str, float]:  
+    return _lmeinput_col_lookup("Value")
+
+def ppiinput_actuals_lookup() -> dict[str, float]:  
+    return _ppiinput_col_lookup("Value")
+
+
+def lmebacktest_actual_vs_predicted() -> dict[str, float]:
+    return _lmebacktest_col_lookup("Predicted (backtest) ($/lb)")
+
+def ppibacktest_actual_vs_predicted() -> dict[str, float]:
+    return _ppibacktest_col_lookup("Predicted (backtest)")
+
+def dashboard_tile_card_alloy_accuracy() -> dict[str, float]:
+    return _lme_col_lookup("Accuracy (%)")
+
+def dashboard_tile_card_ppi_accuracy() -> dict[str, float]:
+    return _ppi_col_lookup("Accuracy (%)")
+
+def ppi_predicted_lookup() -> dict[str, float]:
+    """{YYYY-MM: predicted unit price} from the 'LME Price ($/lb)' column."""
+    return _ppi_col_lookup("PPI Index (dimensionless)")
+
+def dashboard_ppi_actual_vs_predicted() -> dict[str, float]:
+    return _dashboard_col_lookup("ppi_actual_vs_predicted")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARTS SHEET HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_parts_df() -> pd.DataFrame:
+    return _get_sheets()["Parts"]
+
+
+def _make_part_key(part_number: str, tier_1: str) -> tuple[str, str]:
+    return (part_number.strip(), tier_1.strip())
+
+
+def _find_part_row(part_number: str, tier_1: str) -> Optional[pd.Series]:
+    """
+    Find the row in the Parts sheet matching (Part Number, Tier 1).
+    Returns None if not found.
+    """
+    df = _get_parts_df()
+    pn_col = df.columns[0]   # Part Number
+    t1_col = df.columns[1]   # Tier 1
+
+    # Fill NaN in Tier 1 column with empty string before comparison
+    pn_series = df[pn_col].fillna("").astype(str).str.strip()
+    t1_series = df[t1_col].fillna("").astype(str).str.strip()
+
+    mask = (pn_series == part_number.strip()) & (t1_series == tier_1.strip())
+    match = df[mask]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+_MONTH_NAMES = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
+
+
+def _parse_price_month(header) -> Optional[str]:
+    """
+    Extract the 'YYYY-MM' price month from the Parts sheet price column header.
+    Accepts e.g. 'Current Price ($)\\nAug 2026', 'Price August-2026',
+    'Price Sept 2026', 'Price 2026-08', 'Price 08/2026', or a date-typed
+    header cell. Returns None if no month can be found.
+    """
+    if hasattr(header, "strftime"):                      # date-typed header cell
+        return header.strftime("%Y-%m")
+    text = str(header)
+    for word, year in re.findall(r"\b([A-Za-z]{3,9})[\s\-',.]*(\d{4})", text):
+        word = word.lower()
+        month = next((i for name, i in _MONTH_NAMES.items() if name.startswith(word)), None)
+        if month:
+            return f"{year}-{month:02d}"
+    m = re.search(r"(\d{4})[-/](\d{1,2})(?!\d)", text)   # 2026-08
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    m = re.search(r"(?<!\d)(\d{1,2})[-/](\d{4})", text)  # 08/2026
+    if m and 1 <= int(m.group(1)) <= 12:
+        return f"{m.group(2)}-{int(m.group(1)):02d}"
+    return None
+
+# ======================================================================
+# NEW - AOP
+# AOP Calculation - AOP_qty * Final_Unit_price_with_deadband
+# This is the new feature as per thapase/srikanth requirements on 10/20/2026
+def _parse_aop_month(header) -> Optional[str]:
+    """
+    Any month-header convention -> 'YYYY-MM' (None if the header is not a month,
+    e.g. 'Total AOP Qty'). Handles:
+      Oct'26  Oct 26  Oct-26  Oct_26  Oct26  OCT'26  Sept'26  June'27
+      October 2026  Oct-2026  Oct, 2026  AOP Oct 2026  Oct'26 Qty
+      2026-10  2026/10  2026-10-01  10/2026  10-2026  10-26  10/26
+      26-Oct  2026 Oct  01-Oct-26  Excel date / datetime cells
+    """
+    if hasattr(header, "strftime"):                              # real date cell
+        return header.strftime("%Y-%m")
+    text = str(header).strip()
+
+    def _month(word):                                            # 'sept' / 'June' / 'OCT' -> 10
+        word = word.lower()
+        if len(word) < 3:
+            return None
+        return next((i for name, i in _MONTH_NAMES.items() if name.startswith(word)), None)
+
+    ym = _parse_price_month(text)                                # month name/number + 4-digit year
+    if ym:
+        return ym
+    m = re.search(r"(?<![A-Za-z])([A-Za-z]{3,9})[\W_]*(\d{2})(?!\d)", text)       # Oct'26, Oct-26, Oct26
+    if m and _month(m.group(1)):
+        return f"{2000 + int(m.group(2))}-{_month(m.group(1)):02d}"
+    m = re.search(r"(?<!\d)(\d{2})[\W_]*([A-Za-z]{3,9})(?![A-Za-z])", text)       # 26-Oct
+    if m and _month(m.group(2)):
+        return f"{2000 + int(m.group(1))}-{_month(m.group(2)):02d}"
+    m = re.fullmatch(r"(\d{1,2})\s*[-/.]\s*(\d{2})", text)                     # 10-26, 10/26
+    if m and 1 <= int(m.group(1)) <= 12:
+        return f"{2000 + int(m.group(2))}-{int(m.group(1)):02d}"
+    return None
+
+
+def _load_aop_lookup(path: str = EXCEL_FILE_PATH) -> dict:
+    """
+    {(item_number, tier_1, 'YYYY-MM'): aop_qty} from the 'AOP' sheet of the same workbook.
+    Works with BOTH layouts (detected automatically from the header of column B):
+      A) with Tier :  col A = Item Number | col B = Tier 1 | col C onwards = months
+         -> key = (item, tier, month);  a blank Tier cell means "applies to every tier"
+      B) no Tier   :  col A = Item Number | col B onwards = months
+         -> key = (item, "", month)  = applies to every tier
+    Month headers can be in any convention (Oct'26, October 2026, 2026-10, Excel dates...).
+    Item / Tier are compared after strip() and lower-case. Returns {} if the sheet is missing.
+    """
+    try:
+        df = pd.read_excel(
+            path, sheet_name="AOP", engine="openpyxl",
+            dtype=str, keep_default_na=False, na_values=[""],
+        )
+    except (ValueError, FileNotFoundError):          # sheet "AOP" missing / file missing
+        logger.info("No 'AOP' sheet found in %s - Total AOP column will not be added", path)
+        return {}
+    if df.shape[1] < 2:
+        return {}
+
+    pn_col = df.columns[0]
+    has_tier = df.shape[1] > 2 and "tier" in str(df.columns[1]).lower()   # header like 'Tier 1' / 'Tier'
+    t1_col = df.columns[1] if has_tier else None
+
+    month_cols = {}
+    for col in df.columns[(2 if has_tier else 1):]:
+        ym = _parse_aop_month(col)                   # any month-name convention
+        if ym:
+            month_cols[col] = ym
+
+    lookup = {}
+    for _, row in df.iterrows():
+        pn = "" if pd.isna(row[pn_col]) else str(row[pn_col]).strip().lower()
+        if not pn:
+            continue
+        t1 = ""
+        if has_tier and not pd.isna(row[t1_col]):
+            t1 = str(row[t1_col]).strip().lower()
+        for col, ym in month_cols.items():
+            value = row[col]
+            if pd.isna(value):
+                continue
+            try:
+                lookup[(pn, t1, ym)] = float(str(value).replace(",", "").strip())
+            except ValueError:
+                logger.warning("Non-numeric AOP value '%s' for %s / %s / %s - ignored", value, pn, t1, ym)
+    logger.info("Loaded %d AOP values from sheet 'AOP' (Tier column: %s)", len(lookup), "yes" if has_tier else "no")
+    return lookup
+# ======================================================================
+
+
+def get_all_parts() -> list[dict]:
+    """
+    Return all rows from the Parts sheet as a list of dicts.
+    Used by the /parts listing endpoint.
+    """
+    df = _get_parts_df()
+    pn_col    = df.columns[0]
+    tier1_col = df.columns[1]
+    wt_col    = df.columns[2]
+    price_col = df.columns[3]
+    price_month = _parse_price_month(price_col)
+
+    parts = []
+    for _, row in df.iterrows():
+        try:
+            import math
+            wt_val    = row[wt_col]
+            price_val = row[price_col]
+            if str(wt_val) in ("nan", "NaN", "") or str(price_val) in ("nan", "NaN", ""):
+                continue
+            parts.append({
+                "part_number":   str(row[pn_col]).strip(),
+                "tier_1":        str(row[tier1_col]).strip() if str(row[tier1_col]) != "nan" else "NA",
+                "weight_lbs":    float(wt_val),
+                "current_price": float(price_val),
+                "price_month":   price_month,
+            })
+        except (ValueError, TypeError):
+            logger.warning(
+                "Skipping malformed row in Parts sheet: %s", dict(row)
+            )
+    return parts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONCRETE IMPLEMENTATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ExcelMarketDataRepository(MarketDataRepository):
+    """Reads LME, Midwest, PPI from aluminium_data.xlsx."""
+
+    def _lookup(self, sheet: str, year_month: str, label: str) -> Optional[float]:
+        value = _month_lookup(sheet).get(year_month)
+        if value is None:
+            logger.warning("%s data missing in Excel for %s", label, year_month)
+        return value
+
+    def get_lme(self, year_month: str) -> Optional[float]:
+        return self._lookup("LME", year_month, "LME")
+
+    def get_midwest_premium(self, year_month: str) -> Optional[float]:
+        return self._lookup("Midwest", year_month, "Midwest premium")
+
+    def get_ppi(self, year_month: str) -> Optional[float]:
+        return self._lookup("PPI", year_month, "PPI")
+
+class ExcelPartRepository(PartRepository):
+    """
+    Reads part master from the Parts sheet.
+    Lookup key = (Part Number, Tier 1) — both must match.
+    """
+    def get_price_month(self) -> Optional[str]:
+        """Month the Parts sheet prices are for, read from the price column header."""
+        header = _get_parts_df().columns[3]
+        month = _parse_price_month(header)
+        if month is None:
+            logger.warning(
+                "Cannot read price month from Parts column header %r — "
+                "name it like 'Current Price ($) Aug 2026'", header,
+            )
+        return month
+        
+
+
+    def get_part_weight(self, part_number: str, tier_1: str) -> Optional[float]:
+        row = _find_part_row(part_number, tier_1)
+        if row is None:
+            logger.warning(
+                "Part not found in Excel: part_number=%s tier_1=%s",
+                part_number, tier_1,
+            )
+            return None
+        try:
+            return float(row.iloc[2])   # Weight column
+        except (ValueError, TypeError):
+            logger.warning("Invalid weight for %s / %s", part_number, tier_1)
+            return None
+
+    def get_base_price(self, part_number: str, tier_1: str, year_month: str) -> Optional[float]:
+        if year_month != self.get_price_month():
+            return None
+        row = _find_part_row(part_number, tier_1)
+        if row is None:
+            return None
+        try:
+            val = row.iloc[3]           # Current Price column
+            return float(val) if pd.notna(val) else None
+        except (ValueError, TypeError):
+            logger.warning("Invalid price for %s / %s", part_number, tier_1)
+            return None
