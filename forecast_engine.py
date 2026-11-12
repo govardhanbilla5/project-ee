@@ -46,6 +46,9 @@ from app.models.response import (
     MonthForecast,
     QuarterContext,
 )
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -381,6 +384,69 @@ def _compute_price_breakdown(
         ),
         sum_check=sum_check,
     )
+
+
+# ======================================================================
+# NEW - AOP (Annual Operating Plan) helpers.
+# To get AOP quantity values
+# This is the new feature as per thapase/srikanth requirements on 10/20/2026
+
+_AOP_MONTH_FORMATS = ("%B %Y", "%b %Y", "%B-%Y", "%b-%Y", "%b'%y", "%b-%y", "%b %y", "%Y-%m")
+def _aop_month_key(header) -> Optional[str]:
+    """Convert a header (Excel date, 'Oct 2026', 'Oct-2026', '2026-10' ...) to 'YYYY-MM'."""
+    if isinstance(header, (datetime, date)):
+        return f"{header.year}-{header.month:02d}"
+
+    text = str(header or "").strip()
+    for fmt in _AOP_MONTH_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return f"{parsed.year}-{parsed.month:02d}"
+        except ValueError:
+            continue
+    return None
+
+def _aop_part_key(value) -> str:
+    """Excel may store part 221134 as 221134.0 - normalise to plain text."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
+
+
+def build_aop_lookup(rows: list[list]) -> dict[tuple[str, str, str], float]:
+    """
+    AOP sheet as list of rows. Row 0 = header:
+        Part Number | Tier 1 | Oct 2026 | Nov 2026 | ...
+    Returns {(part_number, tier_1, 'YYYY-MM'): aop_qty}. Blank / non-numeric cells are skipped.
+    """
+    if not rows:
+        return {}
+    month_cols = {i: _aop_month_key(h) for i, h in enumerate(rows[0]) if i >= 2 and _aop_month_key(h)}
+    lookup: dict[tuple[str, str, str], float] = {}
+    for row in rows[1:]:
+        if not row or row[0] in (None, ""):
+            continue
+        part = _aop_part_key(row[0])
+        tier = _aop_part_key(row[1]) if len(row) > 1 else ""
+        for col, ym in month_cols.items():
+            qty = row[col] if col < len(row) else None
+            if qty in (None, ""):
+                continue
+            try:
+                lookup[(part, tier, ym)] = float(qty)
+            except (TypeError, ValueError):
+                continue
+    return lookup
+
+def compute_total_aop(unit_price: float, aop_qty: Optional[float]) -> Optional[float]:
+    """Total AOP value = AOP qty x unit price. No AOP qty -> None (blank cell)."""
+    if aop_qty is None:
+        return None
+    return round(unit_price * aop_qty, 2)
+# ======================================================================
+
+
+
 # ---------------------------------------------------------------------------
 # MAIN ENGINE
 # ---------------------------------------------------------------------------
@@ -420,7 +486,11 @@ class ForecastEngine:
 
         # "Today" is taken from the UTC clock; it decides which months are
         # forecast and which market data counts as actual vs projected.
+        # now_utc = datetime.now(timezone.utc)
+        # current_month = now_utc.strftime("%Y-%m")
         now_utc = datetime.now(timezone.utc)
+        #current_month = now_utc.strftime("%Y-%m")
+        now_utc = datetime(now_utc.year, 10, 1, tzinfo=timezone.utc)
         current_month = now_utc.strftime("%Y-%m")
         # P_current = price of the month just before the first forecast month:
         #   include_current_month -> LAST month's price, forecast starts this month
@@ -600,4 +670,28 @@ class ForecastEngine:
             forecast_generated_at=now_utc.isoformat(),
             forecasts=forecasts,
         )
-    
+
+
+    # ======================================================================
+    # NEW - AOP (Annual Operating Plan) helpers.
+    # This is the new feature as per thapase/srikanth requirements on 10/20/2026
+    # ------------------------------------------------------------------ 
+    def apply_aop( 
+        self, 
+        response: "ForecastResponse", 
+        aop_lookup: dict[tuple[str, str, str], float], 
+    ) -> dict[str, tuple[Optional[float], Optional[float]]]: 
+        """ 
+        Total AOP for one part, month by month. 
+        Returns {year_month: (aop_qty, total_aop_value)}. 
+        Uses MonthForecast.predicted_price (final price after deadband = Excel col S). 
+        To use the raw price (col R) use m.predicted_price_without_deadband instead. 
+        """ 
+        part = _aop_part_key(response.part_number) 
+        tier = _aop_part_key(response.tier_1) 
+        result: dict[str, tuple[Optional[float], Optional[float]]] = {} 
+        for m in response.forecasts: 
+            qty = aop_lookup.get((part, tier, m.year_month)) 
+            result[m.year_month] = (qty, compute_total_aop(m.predicted_price, qty)) 
+        return result
+    # ======================================================================
