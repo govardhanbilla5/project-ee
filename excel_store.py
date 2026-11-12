@@ -1,7 +1,8 @@
 """
 Excel-backed market data + part master repository.
 
-Reads aluminium_data.xlsx (5 sheets: Parts, LME, Midwest, PPI, CNG).
+Reads aluminium_data.xlsx (4 sheets: Parts, LME, Midwest, PPI).
+CNG values are not read from Excel — they come from the request body.
 
 PARTS SHEET CONTRACT
 ────────────────────
@@ -9,7 +10,9 @@ Columns (by position):
   0 : Part Number
   1 : Tier 1          ← supplier name (e.g. "Kadon Aerospace", "NA")
   2 : Weight (lbs)
-  3 : Current Price ($)
+  3 : Current Price ($)  ← header MUST name the month the prices are for,
+                           e.g. "Current Price ($) Aug 2026" (also accepts
+                           "August 2026", "2026-08", "08/2026")
 
 The unique key for every part lookup is (Part Number, Tier 1).
 
@@ -19,8 +22,10 @@ Implement MarketDataRepository / PartRepository from app/data/base.py
 and update DI in app/api/v1/endpoints/forecast_excel.py.
 """
 
+import calendar
 import logging
 import os
+import re
 from functools import lru_cache
 from typing import Optional
 
@@ -32,6 +37,124 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "aluminium_data.xlsx")
 EXCEL_FILE_PATH: str = os.environ.get("ALUMINIUM_EXCEL_PATH", _DEFAULT_PATH)
+
+
+
+# =============================================================================
+from openpyxl.cell.cell import MergedCell
+# NEW - Midwest
+# future values of 'midwest_input' ($/MT) -> $/lb -> 'Midwest' sheet
+# Called once from _load_workbook_data() just before the workbook is read, so the engine
+# always reads the values from the 'Midwest' sheet. Nothing else is changed.
+MIDWEST_INPUT_SHEET = "midwest_input"      # sheet the user fills: Month | Future ($/MT) | Past ($/lb)
+MIDWEST_SHEET = "Midwest"                  # sheet the forecast engine reads ($/lb)
+MIDWEST_FUTURE_DIVISOR = 2204.6226         # $/MT -> $/lb (same constant as LME)
+MIDWEST_DECIMALS = 6
+
+
+def _sync_midwest_from_input(path: str) -> int:
+    """
+    Reads 'midwest_input': the FUTURE column ($/MT) is divided by 2204.6226 ($/lb), the PAST column
+    ($/lb) is copied as it is. Both are written into the 'Midwest' sheet (col A = month, col B = value):
+    a month that matches is overwritten, a month that is not there is added at the end.
+    Saves only if something changed.
+    Never raises (a problem is logged and the workbook is read as it is). Returns the number of months written.
+    """
+    try:
+        from copy import copy
+        from datetime import datetime
+        from openpyxl import load_workbook
+
+        def _month(value):
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return None
+            if hasattr(value, "strftime"):
+                return value.strftime("%Y-%m")
+            return _parse_aop_month(str(value).strip())
+
+        def _num(value):
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                return None
+            try:
+                return float(str(value).replace(",", "").strip())
+            except ValueError:
+                return None
+
+        try:
+            df = pd.read_excel(path, sheet_name=MIDWEST_INPUT_SHEET, engine="openpyxl",
+                               dtype=str, keep_default_na=False, na_values=[""])
+        except ValueError:                                   # no 'midwest_input' sheet -> old behaviour
+            return 0
+        if df.shape[1] < 2:
+            return 0
+        cols = list(df.columns)
+        past_col = next((c for c in cols[1:] if "past" in str(c).lower()), None)
+        future_col = next((c for c in cols[1:] if "future" in str(c).lower()), None)
+        if future_col is None:                               # no 'future' word: the column that is not 'past'
+            future_col = next((c for c in cols[1:] if c != past_col), None)
+        if future_col is None:
+            return 0
+        values = {}
+        for _, row in df.iterrows():
+            ym = _month(row[cols[0]])
+            if not ym:
+                continue
+            past = _num(row[past_col]) if past_col is not None else None
+            future = _num(row[future_col])
+            if past is not None:
+                values[ym] = (past, 0.0)                                                  # $/lb, copied as it is
+            if future is not None:                                                        # $/MT -> $/lb (wins if both are filled)
+                values[ym] = (round(future / MIDWEST_FUTURE_DIVISOR, MIDWEST_DECIMALS),
+                              0.5 * 10 ** (-MIDWEST_DECIMALS))
+        if not values:
+            return 0
+
+        mtime = os.path.getmtime(path)
+        wb = load_workbook(path)
+        name = next((n for n in wb.sheetnames if n.strip().lower() == MIDWEST_SHEET.lower()), None)
+        if name is None:
+            return 0
+        ws = wb[name]
+        row_of, last_row = {}, 1
+        for r in range(2, ws.max_row + 1):
+            ym = _month(ws.cell(row=r, column=1).value)
+            if ym:
+                row_of[ym], last_row = r, r
+        month_is_date = hasattr(ws.cell(row=last_row, column=1).value, "strftime")
+
+        changed = 0
+        for ym in sorted(values):
+            new, tolerance = values[ym]
+            if ym in row_of:
+                cell = ws.cell(row=row_of[ym], column=2)
+                old = _num(cell.value)
+                if old is not None and abs(old - new) <= tolerance:
+                    continue                                 # already the same value
+                cell.value = new
+            else:
+                last_row += 1
+                for col in (1, 2):                           # same look as the row above
+                    src, dst = ws.cell(row=last_row - 1, column=col), ws.cell(row=last_row, column=col)
+                    if src.has_style:
+                        dst.font, dst.fill, dst.border = copy(src.font), copy(src.fill), copy(src.border)
+                        dst.alignment, dst.number_format = copy(src.alignment), src.number_format
+                ws.cell(row=last_row, column=1).value = (
+                    datetime(int(ym[:4]), int(ym[5:7]), 1) if month_is_date else ym)
+                ws.cell(row=last_row, column=2).value = new
+            changed += 1
+        if not changed:
+            return 0
+        if os.path.getmtime(path) != mtime:                  # file changed meanwhile -> do not overwrite it
+            logger.warning("Midwest: workbook changed while reading - not written this time")
+            return 0
+        wb.save(path)
+        logger.info("Midwest sheet updated from '%s' ($/MT -> $/lb): %d month(s)", MIDWEST_INPUT_SHEET, changed)
+        return changed
+    except Exception:
+        logger.exception("Midwest: could not update the 'Midwest' sheet from '%s' - workbook read as it is",
+                         MIDWEST_INPUT_SHEET)
+        return 0
+# =============================================================================
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,9 +169,14 @@ def _load_workbook_data(path: str) -> dict[str, pd.DataFrame]:
             f"Excel data file not found at '{path}'. "
             "Set ALUMINIUM_EXCEL_PATH environment variable to the correct path."
         )
+
+    # =============================================================================
+    # NEW - Midwest
+    _sync_midwest_from_input(path)                   # NEW - Midwest: future $/MT -> $/lb into the Midwest sheet
+    # =============================================================================
     sheets = pd.read_excel(
         path,
-        sheet_name=["Parts", "LME", "Midwest", "PPI", "CNG"],
+        sheet_name=["Parts", "LME", "Midwest", "PPI", "AOP", "lme_input", "ppi_input"],  ### NEW NEW NEW
         engine="openpyxl",
         dtype=str,          # read everything as str first; we cast per column
         keep_default_na=False,  # prevent 'NA', 'N/A' etc. from becoming NaN
@@ -118,6 +246,124 @@ def _find_part_row(part_number: str, tier_1: str) -> Optional[pd.Series]:
     return match.iloc[0]
 
 
+_MONTH_NAMES = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
+
+
+def _parse_price_month(header) -> Optional[str]:
+    """
+    Extract the 'YYYY-MM' price month from the Parts sheet price column header.
+    Accepts e.g. 'Current Price ($)\\nAug 2026', 'Price August-2026',
+    'Price Sept 2026', 'Price 2026-08', 'Price 08/2026', or a date-typed
+    header cell. Returns None if no month can be found.
+    """
+    if hasattr(header, "strftime"):                      # date-typed header cell
+        return header.strftime("%Y-%m")
+    text = str(header)
+    for word, year in re.findall(r"\b([A-Za-z]{3,9})[\s\-',.]*(\d{4})", text):
+        word = word.lower()
+        month = next((i for name, i in _MONTH_NAMES.items() if name.startswith(word)), None)
+        if month:
+            return f"{year}-{month:02d}"
+    m = re.search(r"(\d{4})[-/](\d{1,2})(?!\d)", text)   # 2026-08
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    m = re.search(r"(?<!\d)(\d{1,2})[-/](\d{4})", text)  # 08/2026
+    if m and 1 <= int(m.group(1)) <= 12:
+        return f"{m.group(2)}-{int(m.group(1)):02d}"
+    return None
+
+
+# ======================================================================
+# NEW - AOP
+# AOP Calculation - AOP_qty * Final_Unit_price_with_deadband
+# This is the new feature as per thapase/srikanth requirements on 10/20/2026
+def _parse_aop_month(header) -> Optional[str]:
+    """
+    Any month-header convention -> 'YYYY-MM' (None if the header is not a month,
+    e.g. 'Total AOP Qty'). Handles:
+      Oct'26  Oct 26  Oct-26  Oct_26  Oct26  OCT'26  Sept'26  June'27
+      October 2026  Oct-2026  Oct, 2026  AOP Oct 2026  Oct'26 Qty
+      2026-10  2026/10  2026-10-01  10/2026  10-2026  10-26  10/26
+      26-Oct  2026 Oct  01-Oct-26  Excel date / datetime cells
+    """
+    if hasattr(header, "strftime"):                              # real date cell
+        return header.strftime("%Y-%m")
+    text = str(header).strip()
+
+    def _month(word):                                            # 'sept' / 'June' / 'OCT' -> 10
+        word = word.lower()
+        if len(word) < 3:
+            return None
+        return next((i for name, i in _MONTH_NAMES.items() if name.startswith(word)), None)
+
+    ym = _parse_price_month(text)                                # month name/number + 4-digit year
+    if ym:
+        return ym
+    m = re.search(r"(?<![A-Za-z])([A-Za-z]{3,9})[\W_]*(\d{2})(?!\d)", text)       # Oct'26, Oct-26, Oct26
+    if m and _month(m.group(1)):
+        return f"{2000 + int(m.group(2))}-{_month(m.group(1)):02d}"
+    m = re.search(r"(?<!\d)(\d{2})[\W_]*([A-Za-z]{3,9})(?![A-Za-z])", text)       # 26-Oct
+    if m and _month(m.group(2)):
+        return f"{2000 + int(m.group(1))}-{_month(m.group(2)):02d}"
+    m = re.fullmatch(r"(\d{1,2})\s*[-/.]\s*(\d{2})", text)                     # 10-26, 10/26
+    if m and 1 <= int(m.group(1)) <= 12:
+        return f"{2000 + int(m.group(2))}-{int(m.group(1)):02d}"
+    return None
+
+
+def _load_aop_lookup(path: str = EXCEL_FILE_PATH) -> dict:
+    """
+    {(item_number, tier_1, 'YYYY-MM'): aop_qty} from the 'AOP' sheet of the same workbook.
+    Works with BOTH layouts (detected automatically from the header of column B):
+      A) with Tier :  col A = Item Number | col B = Tier 1 | col C onwards = months
+         -> key = (item, tier, month);  a blank Tier cell means "applies to every tier"
+      B) no Tier   :  col A = Item Number | col B onwards = months
+         -> key = (item, "", month)  = applies to every tier
+    Month headers can be in any convention (Oct'26, October 2026, 2026-10, Excel dates...).
+    Item / Tier are compared after strip() and lower-case. Returns {} if the sheet is missing.
+    """
+    try:
+        df = pd.read_excel(
+            path, sheet_name="AOP", engine="openpyxl",
+            dtype=str, keep_default_na=False, na_values=[""],
+        )
+    except (ValueError, FileNotFoundError):          # sheet "AOP" missing / file missing
+        logger.info("No 'AOP' sheet found in %s - Total AOP column will not be added", path)
+        return {}
+    if df.shape[1] < 2:
+        return {}
+
+    pn_col = df.columns[0]
+    has_tier = df.shape[1] > 2 and "tier" in str(df.columns[1]).lower()   # header like 'Tier 1' / 'Tier'
+    t1_col = df.columns[1] if has_tier else None
+
+    month_cols = {}
+    for col in df.columns[(2 if has_tier else 1):]:
+        ym = _parse_aop_month(col)                   # any month-name convention
+        if ym:
+            month_cols[col] = ym
+
+    lookup = {}
+    for _, row in df.iterrows():
+        pn = "" if pd.isna(row[pn_col]) else str(row[pn_col]).strip().lower()
+        if not pn:
+            continue
+        t1 = ""
+        if has_tier and not pd.isna(row[t1_col]):
+            t1 = str(row[t1_col]).strip().lower()
+        for col, ym in month_cols.items():
+            value = row[col]
+            if pd.isna(value):
+                continue
+            try:
+                lookup[(pn, t1, ym)] = float(str(value).replace(",", "").strip())
+            except ValueError:
+                logger.warning("Non-numeric AOP value '%s' for %s / %s / %s - ignored", value, pn, t1, ym)
+    logger.info("Loaded %d AOP values from sheet 'AOP' (Tier column: %s)", len(lookup), "yes" if has_tier else "no")
+    return lookup
+# ======================================================================
+
+
 def get_all_parts() -> list[dict]:
     """
     Return all rows from the Parts sheet as a list of dicts.
@@ -128,6 +374,7 @@ def get_all_parts() -> list[dict]:
     tier1_col = df.columns[1]
     wt_col    = df.columns[2]
     price_col = df.columns[3]
+    price_month = _parse_price_month(price_col)
 
     parts = []
     for _, row in df.iterrows():
@@ -142,6 +389,7 @@ def get_all_parts() -> list[dict]:
                 "tier_1":        str(row[tier1_col]).strip() if str(row[tier1_col]) != "nan" else "NA",
                 "weight_lbs":    float(wt_val),
                 "current_price": float(price_val),
+                "price_month":   price_month,
             })
         except (ValueError, TypeError):
             logger.warning(
@@ -155,7 +403,7 @@ def get_all_parts() -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ExcelMarketDataRepository(MarketDataRepository):
-    """Reads LME, Midwest, PPI, CNG from aluminium_data.xlsx (all $/lb)."""
+    """Reads LME, Midwest, PPI from aluminium_data.xlsx."""
 
     def _lookup(self, sheet: str, year_month: str, label: str) -> Optional[float]:
         value = _month_lookup(sheet).get(year_month)
@@ -171,18 +419,25 @@ class ExcelMarketDataRepository(MarketDataRepository):
 
     def get_ppi(self, year_month: str) -> Optional[float]:
         return self._lookup("PPI", year_month, "PPI")
-
-    def get_cng(self, year_month: str) -> Optional[float]:
-        return self._lookup("CNG", year_month, "CNG")
-
+    
 
 class ExcelPartRepository(PartRepository):
     """
     Reads part master from the Parts sheet.
     Lookup key = (Part Number, Tier 1) — both must match.
     """
+    def get_price_month(self) -> Optional[str]:
+        """Month the Parts sheet prices are for, read from the price column header."""
+        header = _get_parts_df().columns[3]
+        month = _parse_price_month(header)
+        if month is None:
+            logger.warning(
+                "Cannot read price month from Parts column header %r — "
+                "name it like 'Current Price ($) Aug 2026'", header,
+            )
+        return month
+        
 
-    _PRICE_MONTH = "2026-08"   # month for which prices are stored in Excel
 
     def get_part_weight(self, part_number: str, tier_1: str) -> Optional[float]:
         row = _find_part_row(part_number, tier_1)
@@ -199,7 +454,7 @@ class ExcelPartRepository(PartRepository):
             return None
 
     def get_base_price(self, part_number: str, tier_1: str, year_month: str) -> Optional[float]:
-        if year_month != self._PRICE_MONTH:
+        if year_month != self.get_price_month():
             return None
         row = _find_part_row(part_number, tier_1)
         if row is None:
